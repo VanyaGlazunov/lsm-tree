@@ -1,33 +1,35 @@
 use std::cmp::Ordering;
+
 #[allow(dead_code)]
-struct Node {
+struct Node<'a> {
     key: i32,
-    value: i32,
-    height: i32,
-    left_child: Option<Box<Node>>,
-    right_child: Option<Box<Node>>,
+    vector: &'a Vec<i32>,
+    index: usize,
+    height: i8,
+    left_child: Option<Box<Node<'a>>>,
+    right_child: Option<Box<Node<'a>>>,
 }
 
 #[allow(dead_code)]
-pub struct AVL {
-    root: Option<Box<Node>>,
+pub struct AVL<'a> {
+    root: Option<Box<Node<'a>>>,
 }
 
 #[allow(dead_code)]
-impl AVL {
-    fn new() -> Self {
+impl<'a> AVL<'a> {
+    pub fn new() -> Self {
         AVL { root: None }
     }
-    fn insert(&mut self, key: i32, value: i32) {
-        self.root = Some(Node::insert(self.root.take(), key, value).1)
+    pub fn insert(&mut self, key: i32, vector: &'a Vec<i32>, index: usize) {
+        self.root = Some(Node::insert(self.root.take(), key, &vector, index).1)
     }
-    fn find(&self, key: i32) -> Option<i32> {
+    pub fn find(&self, key: i32) -> Option<i32> {
         match &self.root {
             Some(root) => root.find(key),
             None => None,
         }
     }
-    fn erase(&mut self, key: i32) {
+    pub fn erase(&mut self, key: i32) {
         if let Some(root) = self.root.take() {
             self.root = Node::erase(root, key);
         }
@@ -35,11 +37,12 @@ impl AVL {
 }
 
 #[allow(dead_code)]
-impl Node {
-    fn new(key: i32, value: i32) -> Self {
+impl<'a> Node<'a> {
+    fn new(key: i32, vector: &'a Vec<i32>, index: usize) -> Self {
         Node {
             key,
-            value,
+            vector,
+            index,
             height: 1,
             left_child: None,
             right_child: None,
@@ -57,7 +60,7 @@ impl Node {
         }
         self.height = max_height + 1;
     }
-    fn get_balance(&self) -> i32 {
+    fn get_balance(&self) -> i8 {
         match (&self.left_child, &self.right_child) {
             (Some(left_child), Some(right_child)) => left_child.height - right_child.height,
             (Some(left_child), None) => left_child.height,
@@ -112,23 +115,23 @@ impl Node {
             _ => this,
         }
     }
-    fn insert(this: Option<Box<Node>>, key: i32, value: i32) -> (bool, Box<Node>) {
+    fn insert(this: Option<Box<Node<'a>>>, key: i32, vector: &'a Vec<i32>, index: usize) -> (bool, Box<Node<'a>>) {
         if this.is_none() {
-            return (true, Box::new(Self::new(key, value)));
+            return (true, Box::new(Self::new(key, &vector, index)));
         }
         let mut node = this.unwrap();
         let mut is_inserted = false;
         match key.cmp(&node.key) {
             Ordering::Less => {
-                let result = Self::insert(node.left_child, key, value);
+                let result = Self::insert(node.left_child, key, &vector, index);
                 node.left_child = Some(result.1);
                 is_inserted = result.0;
             }
             Ordering::Equal => {
-                node.value = value;
+                node.vector = vector;
             }
             Ordering::Greater => {
-                let result = Self::insert(node.right_child, key, value);
+                let result = Self::insert(node.right_child, key, &vector, index);
                 node.right_child = Some(result.1);
                 is_inserted = result.0;
             }
@@ -139,7 +142,7 @@ impl Node {
     fn find(&self, key: i32) -> Option<i32> {
         let child = match key.cmp(&self.key) {
             Ordering::Less => &self.left_child,
-            Ordering::Equal => return Some(self.value),
+            Ordering::Equal => return Some(self.vector[self.index]),
             Ordering::Greater => &self.right_child,
         };
 
@@ -160,7 +163,7 @@ impl Node {
             Ordering::Equal => match (this.left_child.take(), this.right_child.take()) {
                 (Some(_left_child), Some(right_child)) => {
                     let right_min = right_child.min();
-                    this.value = right_min.value;
+                    this.vector = right_min.vector;
                     this.key = right_min.key;
                     this.right_child = Node::erase(right_child, this.key);
                     this.update_height();
@@ -234,49 +237,58 @@ mod avl_tests {
     #[test]
     fn insert_find_one_elem() {
         let mut avl = AVL::new();
-        avl.insert(1, 1);
+        let vector = vec![1, 2, 3];
+        avl.insert(1, &vector, 0);
         assert_eq!(avl.find(1).unwrap(), 1);
     }
     #[test]
     fn insert_erase_find_one_elem() {
         let mut avl = AVL::new();
-        avl.insert(1, 1);
+        let vector = vec![1, 2, 3];
+        avl.insert(1, &vector, 0);
         avl.erase(1);
         assert_eq!(avl.find(1), None);
     }
     #[test]
     fn insert_ordered_sequence() {
         let mut avl = AVL::new();
-        for i in 1..100 {
-            avl.insert(i, i);
+        let vector : Vec<i32> = (0..100).collect();
+        for key in 0..100 {
+            avl.insert(key, &vector, key.try_into().unwrap());
         }
-        for i in 1..100 {
-            assert_ne!(avl.find(i), None, "{} not found!", i);
+
+        for key in 0..100 {
+            assert_ne!(avl.find(key), None, "{key} not found!");
         }
         assert!(check_correctness(avl.root.as_ref().unwrap()));
     }
     #[test]
     fn insert_reverse_ordered_sequence() {
         let mut avl = AVL::new();
-        for i in (1..100).rev() {
-            avl.insert(i, i);
+        let vector : Vec<i32> = (0..100).collect();
+        for key in (0..100).rev() {
+            avl.insert(key, &vector, key.try_into().unwrap());
             println!();
         }
-        for i in 1..100 {
-            assert_ne!(avl.find(i), None, "{} not found!", i);
+
+        for key in 0..100 {
+            assert_ne!(avl.find(key), None, "{key} not found!");
         }
         assert!(check_correctness(avl.root.as_ref().unwrap()));
     }
     #[test]
     fn insert_erase_find() {
         let mut avl = AVL::new();
-        for key in 1..100 {
-            avl.insert(key, key);
+        let vector : Vec<i32> = (0..100).collect();
+        for key in 0..100 {
+            avl.insert(key, &vector, key.try_into().unwrap());
         }
-        for key in 1..100 {
+    
+        for key in 0..100 {
             avl.erase(key);
         }
-        for key in 1..100 {
+
+        for key in 0..100 {
             assert_eq!(avl.find(key), None);
         }
     }
