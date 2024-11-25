@@ -1,200 +1,279 @@
+use std::cmp;
 use std::cmp::Ordering;
+use std::mem;
 
 #[allow(dead_code)]
-struct Node<'a> {
-    key: i32,
-    vector: &'a Vec<i32>,
-    index: usize,
+#[derive(Debug, Clone)]
+struct Node<K, V> {
+    key: K,
+    value: V,
     height: i8,
-    left_child: Option<Box<Node<'a>>>,
-    right_child: Option<Box<Node<'a>>>,
+    left_child: Option<Box<Node<K, V>>>,
+    right_child: Option<Box<Node<K, V>>>,
 }
 
 #[allow(dead_code)]
-pub struct AVL<'a> {
-    root: Option<Box<Node<'a>>>,
+#[derive(Debug)]
+pub struct AVL<K, V> {
+    root: Option<Box<Node<K, V>>>,
+}
+
+pub struct AVLIterator<'a, K, V> {
+    prev_nodes: Vec<&'a Node<K, V>>,
+    current_node: &'a Option<Box<Node<K, V>>>,
 }
 
 #[allow(dead_code)]
-impl<'a> AVL<'a> {
+impl<K: Ord + Clone, V: Clone> AVL<K, V> {
     pub fn new() -> Self {
         AVL { root: None }
     }
-    pub fn insert(&mut self, key: i32, vector: &'a Vec<i32>, index: usize) {
-        self.root = Some(Node::insert(self.root.take(), key, &vector, index).1)
+
+    fn iter<'a>(&'a self) -> AVLIterator<'a, K, V> {
+        AVLIterator {
+            prev_nodes: Vec::new(),
+            current_node: &self.root,
+        }
     }
-    pub fn find(&self, key: i32) -> Option<i32> {
+
+    pub fn insert(&mut self, key: K, value: V) {
+        self.root = Some(Node::insert(self.root.take(), key, value));
+    }
+
+    pub fn get(&self, key: &K) -> Option<V> {
         match &self.root {
-            Some(root) => root.find(key),
+            Some(root) => root.get(key),
             None => None,
         }
     }
-    pub fn erase(&mut self, key: i32) {
+
+    pub fn contains(&self, key: &K) -> bool {
+        match &self.root {
+            Some(root) => root.contains(key),
+            None => false,
+        }
+    }
+
+    pub fn remove(&mut self, key: &K) {
         if let Some(root) = self.root.take() {
-            self.root = Node::erase(root, key);
+            self.root = Node::remove(root, key);
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for AVLIterator<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.current_node {
+                None => {
+                    match self.prev_nodes.pop() {
+                        None => {
+                            return None
+                        },
+                        Some(prev_node) => {
+                            self.current_node = &prev_node.right_child;
+
+                            return Some((&prev_node.key, &prev_node.value))
+                        }
+                    }
+                }
+                Some(current_node) => {
+                    if current_node.left_child.is_some() {
+                        self.prev_nodes.push(current_node);
+                        self.current_node = &current_node.left_child;
+                    } else if current_node.right_child.is_some() {
+                        self.current_node = &current_node.right_child;
+                        return Some((&current_node.key, &current_node.value));
+                    } else {
+                        self.current_node = &None;
+                        return Some((&current_node.key, &current_node.value));
+                    }
+                }
+            }
         }
     }
 }
 
 #[allow(dead_code)]
-impl<'a> Node<'a> {
-    fn new(key: i32, vector: &'a Vec<i32>, index: usize) -> Self {
+impl<K: Ord + Clone, V: Clone> Node<K, V> {
+    fn new(key: K, value: V) -> Self {
         Node {
             key,
-            vector,
-            index,
+            value,
             height: 1,
             left_child: None,
             right_child: None,
         }
     }
+
+    fn get_left_height(&self) -> i8 {
+        match &self.left_child {
+            Some(left_child) => left_child.height,
+            None => 0,
+        }
+    }
+
+    fn get_right_height(&self) -> i8 {
+        match &self.right_child {
+            Some(right_child) => right_child.height,
+            None => 0,
+        }
+    }
+
     fn update_height(&mut self) {
-        let mut max_height = 0;
-        if let Some(left_child) = &self.left_child {
-            max_height = left_child.height;
-        }
-        if let Some(right_child) = &self.right_child {
-            if right_child.height > max_height {
-                max_height = right_child.height;
-            }
-        }
-        self.height = max_height + 1;
+        self.height = cmp::max(self.get_left_height(), self.get_right_height()) + 1;
     }
+
     fn get_balance(&self) -> i8 {
-        match (&self.left_child, &self.right_child) {
-            (Some(left_child), Some(right_child)) => left_child.height - right_child.height,
-            (Some(left_child), None) => left_child.height,
-            (None, Some(right_child)) => -right_child.height,
-            (None, None) => 0,
-        }
+        self.get_left_height() - self.get_right_height()
     }
-    fn rotate_left(mut this: Box<Node>) -> Box<Node> {
-        if this.right_child.is_none() {
-            return this;
+
+    fn rotate_left(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+        if node.right_child.is_none() {
+            return node;
         }
-        let mut right_node = this.right_child.take().unwrap();
-        this.right_child = right_node.left_child;
-        this.update_height();
-        right_node.left_child = Some(this);
+        let mut right_node = node.right_child.take().unwrap();
+        node.right_child = right_node.left_child;
+        node.update_height();
+        right_node.left_child = Some(node);
         right_node.update_height();
         right_node
     }
-    fn rotate_right(mut this: Box<Node>) -> Box<Node> {
-        if this.left_child.is_none() {
-            return this;
+
+    fn rotate_right(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+        if node.left_child.is_none() {
+            return node;
         }
-        let mut left_node = this.left_child.take().unwrap();
-        this.left_child = left_node.right_child;
-        this.update_height();
-        left_node.right_child = Some(this);
+        let mut left_node = node.left_child.take().unwrap();
+        node.left_child = left_node.right_child;
+        node.update_height();
+        left_node.right_child = Some(node);
         left_node.update_height();
         left_node
     }
-    fn big_rotate_left(mut this: Box<Node>) -> Box<Node> {
-        this.right_child = Some(Self::rotate_right(this.right_child.unwrap()));
-        Self::rotate_left(this)
+
+    fn big_rotate_left(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+        node.right_child = Some(Self::rotate_right(node.right_child.unwrap()));
+        Self::rotate_left(node)
     }
-    fn big_rotate_right(mut this: Box<Node>) -> Box<Node> {
-        this.left_child = Some(Self::rotate_left(this.left_child.unwrap()));
-        Self::rotate_right(this)
+
+    fn big_rotate_right(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+        node.left_child = Some(Self::rotate_left(node.left_child.unwrap()));
+        Self::rotate_right(node)
     }
-    fn balance(this: Box<Node>) -> Box<Node> {
-        match this.get_balance() {
+
+    fn balance(node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+        match node.get_balance() {
             -2 => {
-                if this.right_child.as_ref().unwrap().get_balance() <= 0 {
-                    return Self::rotate_left(this);
+                if node.right_child.as_ref().unwrap().get_balance() <= 0 {
+                    return Self::rotate_left(node);
                 }
-                Self::big_rotate_left(this)
+                Self::big_rotate_left(node)
             }
             2 => {
-                if this.left_child.as_ref().unwrap().get_balance() > 0 {
-                    return Self::rotate_right(this);
+                if node.left_child.as_ref().unwrap().get_balance() > 0 {
+                    return Self::rotate_right(node);
                 }
-                Self::big_rotate_right(this)
+                Self::big_rotate_right(node)
             }
-            _ => this,
+            _ => node,
         }
     }
-    fn insert(this: Option<Box<Node<'a>>>, key: i32, vector: &'a Vec<i32>, index: usize) -> (bool, Box<Node<'a>>) {
-        if this.is_none() {
-            return (true, Box::new(Self::new(key, &vector, index)));
+
+    fn insert(node: Option<Box<Node<K, V>>>, key: K, value: V) -> Box<Node<K, V>> {
+        if node.is_none() {
+            return Box::new(Self::new(key, value));
         }
-        let mut node = this.unwrap();
-        let mut is_inserted = false;
+        let mut node = node.unwrap();
         match key.cmp(&node.key) {
             Ordering::Less => {
-                let result = Self::insert(node.left_child, key, &vector, index);
-                node.left_child = Some(result.1);
-                is_inserted = result.0;
+                let result = Self::insert(node.left_child, key, value);
+                node.left_child = Some(result);
             }
             Ordering::Equal => {
-                node.vector = vector;
+                node.value = value;
             }
             Ordering::Greater => {
-                let result = Self::insert(node.right_child, key, &vector, index);
-                node.right_child = Some(result.1);
-                is_inserted = result.0;
+                let result = Self::insert(node.right_child, key, value);
+                node.right_child = Some(result);
             }
         };
         node.update_height();
-        (is_inserted, Self::balance(node))
+        Self::balance(node)
     }
-    fn find(&self, key: i32) -> Option<i32> {
+
+    fn get(&self, key: &K) -> Option<V> {
         let child = match key.cmp(&self.key) {
             Ordering::Less => &self.left_child,
-            Ordering::Equal => return Some(self.vector[self.index]),
+            Ordering::Equal => return Some(self.value.clone()),
             Ordering::Greater => &self.right_child,
         };
 
         match child {
-            Some(node) => node.find(key),
+            Some(node) => node.get(key),
             None => None,
         }
     }
-    fn erase(mut this: Box<Node>, key: i32) -> Option<Box<Node>> {
-        match key.cmp(&this.key) {
+
+    fn contains(&self, key: &K) -> bool {
+        let child = match key.cmp(&self.key) {
+            Ordering::Less => &self.left_child,
+            Ordering::Equal => return true,
+            Ordering::Greater => &self.right_child,
+        };
+
+        child.is_none()
+    }
+
+    fn remove(mut node: Box<Node<K, V>>, key: &K) -> Option<Box<Node<K, V>>> {
+        match key.cmp(&node.key) {
             Ordering::Less => {
-                if let Some(left_child) = this.left_child.take() {
-                    this.left_child = Self::erase(left_child, key);
-                    this.update_height();
+                if let Some(left_child) = node.left_child.take() {
+                    node.left_child = Self::remove(left_child, key);
+                    node.update_height();
                 }
-                Some(Node::balance(this))
+                Some(Node::balance(node))
             }
-            Ordering::Equal => match (this.left_child.take(), this.right_child.take()) {
+            Ordering::Equal => match (node.left_child.take(), node.right_child.take()) {
                 (Some(_left_child), Some(right_child)) => {
-                    let right_min = right_child.min();
-                    this.vector = right_min.vector;
-                    this.key = right_min.key;
-                    this.right_child = Node::erase(right_child, this.key);
-                    this.update_height();
-                    Some(Node::balance(this))
+                    let mut right_min = right_child.get_min();
+                    mem::swap(node.as_mut(), &mut right_min);
+                    node.right_child = Node::remove(right_child, &node.key);
+                    node.update_height();
+                    Some(Node::balance(node))
                 }
                 (Some(left_child), None) => Some(left_child),
                 (None, Some(right_child)) => Some(right_child),
                 (None, None) => None,
             },
             Ordering::Greater => {
-                if let Some(right_child) = this.right_child.take() {
-                    this.right_child = Self::erase(right_child, key);
-                    this.update_height();
+                if let Some(right_child) = node.right_child.take() {
+                    node.right_child = Self::remove(right_child, key);
+                    node.update_height();
                 }
-                Some(Node::balance(this))
+                Some(Node::balance(node))
             }
         }
     }
-    fn min(&self) -> &Self {
+
+    fn get_min(&self) -> Self {
         if let Some(left_child) = &self.left_child {
-            return left_child.min();
+            return Node::get_min(left_child);
         };
-        self
+
+        self.clone()
     }
 }
 
 #[cfg(test)]
 mod avl_tests {
+    use std::iter::zip;
+
     use super::*;
 
-    fn get_height(avl_node: &Node) -> i32 {
+    fn get_height<K, V>(avl_node: &Node<K, V>) -> i32 {
         let mut max_height = 0;
         if let Some(left_child) = &avl_node.left_child {
             max_height = get_height(&left_child);
@@ -208,7 +287,7 @@ mod avl_tests {
         max_height + 1
     }
 
-    fn get_balance(avl_node: &Node) -> i32 {
+    fn get_balance<K, V>(avl_node: &Node<K, V>) -> i32 {
         let mut balance = 0;
         if let Some(left_child) = &avl_node.left_child {
             balance += get_height(&left_child);
@@ -219,7 +298,7 @@ mod avl_tests {
         balance
     }
 
-    fn check_correctness(avl_node: &Node) -> bool {
+    fn check_correctness<K, V>(avl_node: &Node<K, V>) -> bool {
         let balance = get_balance(avl_node);
         if balance > 1 || balance < -1 {
             return false;
@@ -237,59 +316,61 @@ mod avl_tests {
     #[test]
     fn insert_find_one_elem() {
         let mut avl = AVL::new();
-        let vector = vec![1, 2, 3];
-        avl.insert(1, &vector, 0);
-        assert_eq!(avl.find(1).unwrap(), 1);
+        avl.insert(1, 1);
+        assert_eq!(avl.get(&1).unwrap(), 1);
     }
-    #[test]
-    fn insert_erase_find_one_elem() {
-        let mut avl = AVL::new();
-        let vector = vec![1, 2, 3];
-        avl.insert(1, &vector, 0);
-        avl.erase(1);
-        assert_eq!(avl.find(1), None);
-    }
+
     #[test]
     fn insert_ordered_sequence() {
         let mut avl = AVL::new();
-        let vector : Vec<i32> = (0..100).collect();
         for key in 0..100 {
-            avl.insert(key, &vector, key.try_into().unwrap());
+            avl.insert(key, key);
         }
 
         for key in 0..100 {
-            assert_ne!(avl.find(key), None, "{key} not found!");
+            assert_ne!(avl.get(&key), None);
         }
         assert!(check_correctness(avl.root.as_ref().unwrap()));
     }
+
     #[test]
     fn insert_reverse_ordered_sequence() {
         let mut avl = AVL::new();
-        let vector : Vec<i32> = (0..100).collect();
         for key in (0..100).rev() {
-            avl.insert(key, &vector, key.try_into().unwrap());
-            println!();
+            avl.insert(key, key);
         }
 
         for key in 0..100 {
-            assert_ne!(avl.find(key), None, "{key} not found!");
+            assert_ne!(avl.get(&key), None);
         }
         assert!(check_correctness(avl.root.as_ref().unwrap()));
     }
+
     #[test]
     fn insert_erase_find() {
         let mut avl = AVL::new();
-        let vector : Vec<i32> = (0..100).collect();
         for key in 0..100 {
-            avl.insert(key, &vector, key.try_into().unwrap());
-        }
-    
-        for key in 0..100 {
-            avl.erase(key);
+            avl.insert(key, key);
         }
 
         for key in 0..100 {
-            assert_eq!(avl.find(key), None);
+            avl.remove(&key);
+        }
+
+        for key in 0..100 {
+            assert_eq!(avl.get(&key), None);
+        }
+    }
+
+    #[test]
+    fn chek_iter() {
+        let mut avl = AVL::new();
+        for key in 0..100 {
+            avl.insert(key, key);
+        }
+        
+        for (actual, expected) in zip(avl.iter(), 0..100) {
+            assert_eq!(actual, (&expected, &expected));
         }
     }
 }
