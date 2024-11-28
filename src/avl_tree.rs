@@ -1,49 +1,50 @@
-use std::cmp;
 use std::cmp::Ordering;
-use std::mem;
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek, Write};
+use std::{cmp, io};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
-struct Node<K, V> {
+enum Data {
+    Value(Vec<u8>),
+    Pointer(String, u64, usize),
+}
+
+#[derive(Debug, Clone)]
+struct Node<K> {
     key: K,
-    value: V,
+    value: Data,
     height: i8,
-    left_child: Option<Box<Node<K, V>>>,
-    right_child: Option<Box<Node<K, V>>>,
+    left_child: Option<Box<Node<K>>>,
+    right_child: Option<Box<Node<K>>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
-pub struct AVL<K, V> {
-    root: Option<Box<Node<K, V>>>,
-}
-
-pub struct AVLIterator<'a, K, V> {
-    prev_nodes: Vec<&'a Node<K, V>>,
-    current_node: &'a Option<Box<Node<K, V>>>,
+pub struct AVLtree<K> {
+    root: Option<Box<Node<K>>>,
+    size: u32,
 }
 
 #[allow(dead_code)]
-impl<K: Ord + Clone, V: Clone> AVL<K, V> {
+impl<K: Ord + Clone> AVLtree<K> {
     pub fn new() -> Self {
-        AVL { root: None }
-    }
-
-    fn iter<'a>(&'a self) -> AVLIterator<'a, K, V> {
-        AVLIterator {
-            prev_nodes: Vec::new(),
-            current_node: &self.root,
+        AVLtree {
+            root: None,
+            size: 0,
         }
     }
 
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    pub fn insert(&mut self, key: K, value: Vec<u8>) {
         self.root = Some(Node::insert(self.root.take(), key, value));
     }
 
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub fn get(&self, key: &K) -> io::Result<Vec<u8>> {
         match &self.root {
             Some(root) => root.get(key),
-            None => None,
+            None => Err(ErrorKind::NotFound.into()),
         }
     }
 
@@ -54,41 +55,19 @@ impl<K: Ord + Clone, V: Clone> AVL<K, V> {
         }
     }
 
-    pub fn remove(&mut self, key: &K) {
-        if let Some(root) = self.root.take() {
-            self.root = Node::remove(root, key);
-        }
-    }
-}
-
-impl<'a, K, V> Iterator for AVLIterator<'a, K, V> {
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.current_node {
-                None => {
-                    match self.prev_nodes.pop() {
-                        None => {
-                            return None
-                        },
-                        Some(prev_node) => {
-                            self.current_node = &prev_node.right_child;
-
-                            return Some((&prev_node.key, &prev_node.value))
-                        }
-                    }
-                }
-                Some(current_node) => {
-                    if current_node.left_child.is_some() {
-                        self.prev_nodes.push(current_node);
-                        self.current_node = &current_node.left_child;
-                    } else if current_node.right_child.is_some() {
-                        self.current_node = &current_node.right_child;
-                        return Some((&current_node.key, &current_node.value));
-                    } else {
-                        self.current_node = &None;
-                        return Some((&current_node.key, &current_node.value));
+    pub fn flush(&mut self, path: String) -> io::Result<()> {
+        let mut buffer = Vec::<u8>::new();
+        match self.root.take() {
+            None => Ok(()),
+            Some(root) => {
+                let flush_result = Node::flush(root, &path, 0, &mut buffer);
+                match flush_result {
+                    Err(e) => Err(e),
+                    Ok(result) => {
+                        self.root = result.0;
+                        let mut file = File::create(path)?;
+                        file.write_all(&buffer)?;
+                        Ok(())
                     }
                 }
             }
@@ -97,14 +76,28 @@ impl<'a, K, V> Iterator for AVLIterator<'a, K, V> {
 }
 
 #[allow(dead_code)]
-impl<K: Ord + Clone, V: Clone> Node<K, V> {
-    fn new(key: K, value: V) -> Self {
+impl<K: Ord + Clone> Node<K> {
+    fn new(key: K, value: Vec<u8>) -> Self {
         Node {
             key,
-            value,
+            value: Data::Value(value),
             height: 1,
             left_child: None,
             right_child: None,
+        }
+    }
+
+    fn get_value(&self) -> io::Result<Vec<u8>> {
+        match &self.value {
+            Data::Value(value) => Ok(value.clone()),
+            Data::Pointer(path, position, size) => {
+                let mut file = File::open(path)?;
+
+                file.seek(io::SeekFrom::Start(*position))?;
+                let mut value = vec![0; *size];
+                file.read(&mut value)?;
+                Ok(value)
+            }
         }
     }
 
@@ -130,7 +123,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         self.get_left_height() - self.get_right_height()
     }
 
-    fn rotate_left(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+    fn rotate_left(mut node: Box<Node<K>>) -> Box<Node<K>> {
         if node.right_child.is_none() {
             return node;
         }
@@ -142,7 +135,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         right_node
     }
 
-    fn rotate_right(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+    fn rotate_right(mut node: Box<Node<K>>) -> Box<Node<K>> {
         if node.left_child.is_none() {
             return node;
         }
@@ -154,17 +147,17 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         left_node
     }
 
-    fn big_rotate_left(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+    fn big_rotate_left(mut node: Box<Node<K>>) -> Box<Node<K>> {
         node.right_child = Some(Self::rotate_right(node.right_child.unwrap()));
         Self::rotate_left(node)
     }
 
-    fn big_rotate_right(mut node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+    fn big_rotate_right(mut node: Box<Node<K>>) -> Box<Node<K>> {
         node.left_child = Some(Self::rotate_left(node.left_child.unwrap()));
         Self::rotate_right(node)
     }
 
-    fn balance(node: Box<Node<K, V>>) -> Box<Node<K, V>> {
+    fn balance(node: Box<Node<K>>) -> Box<Node<K>> {
         match node.get_balance() {
             -2 => {
                 if node.right_child.as_ref().unwrap().get_balance() <= 0 {
@@ -182,7 +175,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         }
     }
 
-    fn insert(node: Option<Box<Node<K, V>>>, key: K, value: V) -> Box<Node<K, V>> {
+    fn insert(node: Option<Box<Node<K>>>, key: K, value: Vec<u8>) -> Box<Node<K>> {
         if node.is_none() {
             return Box::new(Self::new(key, value));
         }
@@ -193,7 +186,7 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                 node.left_child = Some(result);
             }
             Ordering::Equal => {
-                node.value = value;
+                node.value = Data::Value(value);
             }
             Ordering::Greater => {
                 let result = Self::insert(node.right_child, key, value);
@@ -204,16 +197,16 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         Self::balance(node)
     }
 
-    fn get(&self, key: &K) -> Option<V> {
+    fn get(&self, key: &K) -> io::Result<Vec<u8>> {
         let child = match key.cmp(&self.key) {
             Ordering::Less => &self.left_child,
-            Ordering::Equal => return Some(self.value.clone()),
+            Ordering::Equal => return self.get_value(),
             Ordering::Greater => &self.right_child,
         };
 
         match child {
             Some(node) => node.get(key),
-            None => None,
+            None => Err(ErrorKind::NotFound.into()),
         }
     }
 
@@ -227,37 +220,6 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
         child.is_none()
     }
 
-    fn remove(mut node: Box<Node<K, V>>, key: &K) -> Option<Box<Node<K, V>>> {
-        match key.cmp(&node.key) {
-            Ordering::Less => {
-                if let Some(left_child) = node.left_child.take() {
-                    node.left_child = Self::remove(left_child, key);
-                    node.update_height();
-                }
-                Some(Node::balance(node))
-            }
-            Ordering::Equal => match (node.left_child.take(), node.right_child.take()) {
-                (Some(_left_child), Some(right_child)) => {
-                    let mut right_min = right_child.get_min();
-                    mem::swap(node.as_mut(), &mut right_min);
-                    node.right_child = Node::remove(right_child, &node.key);
-                    node.update_height();
-                    Some(Node::balance(node))
-                }
-                (Some(left_child), None) => Some(left_child),
-                (None, Some(right_child)) => Some(right_child),
-                (None, None) => None,
-            },
-            Ordering::Greater => {
-                if let Some(right_child) = node.right_child.take() {
-                    node.right_child = Self::remove(right_child, key);
-                    node.update_height();
-                }
-                Some(Node::balance(node))
-            }
-        }
-    }
-
     fn get_min(&self) -> Self {
         if let Some(left_child) = &self.left_child {
             return Node::get_min(left_child);
@@ -265,15 +227,44 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
 
         self.clone()
     }
+
+    fn flush<'a>(
+        mut node: Box<Node<K>>,
+        path: &String,
+        position: u64,
+        buffer: &'a mut Vec<u8>,
+    ) -> io::Result<(Option<Box<Node<K>>>, u64)> {
+        match node.value {
+            Data::Pointer(_path, _position, _len) => Ok((None, 0)),
+            Data::Value(mut value) => {
+                let mut next_pos = position;
+                if let Some(left_child) = node.left_child {
+                    (node.left_child, next_pos) =
+                        Node::flush(left_child, path, next_pos, buffer).unwrap();
+                }
+
+                let len = value.len();
+                buffer.append(&mut value);
+                node.value = Data::Pointer(path.clone(), next_pos, len);
+                next_pos += len as u64;
+
+                if let Some(right_child) = node.right_child {
+                    (node.right_child, next_pos) =
+                        Node::flush(right_child, path, next_pos, buffer).unwrap();
+                }
+
+                Ok((Some(node), next_pos))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod avl_tests {
-    use std::iter::zip;
-
     use super::*;
+    use tempfile::{self, NamedTempFile};
 
-    fn get_height<K, V>(avl_node: &Node<K, V>) -> i32 {
+    fn get_height<K>(avl_node: &Node<K>) -> i32 {
         let mut max_height = 0;
         if let Some(left_child) = &avl_node.left_child {
             max_height = get_height(&left_child);
@@ -287,7 +278,7 @@ mod avl_tests {
         max_height + 1
     }
 
-    fn get_balance<K, V>(avl_node: &Node<K, V>) -> i32 {
+    fn get_balance<K>(avl_node: &Node<K>) -> i32 {
         let mut balance = 0;
         if let Some(left_child) = &avl_node.left_child {
             balance += get_height(&left_child);
@@ -298,7 +289,7 @@ mod avl_tests {
         balance
     }
 
-    fn check_correctness<K, V>(avl_node: &Node<K, V>) -> bool {
+    fn check_correctness<K>(avl_node: &Node<K>) -> bool {
         let balance = get_balance(avl_node);
         if balance > 1 || balance < -1 {
             return false;
@@ -314,63 +305,110 @@ mod avl_tests {
     }
 
     #[test]
-    fn insert_find_one_elem() {
-        let mut avl = AVL::new();
-        avl.insert(1, 1);
-        assert_eq!(avl.get(&1).unwrap(), 1);
+    fn insert_one_elem() {
+        let mut avl = AVLtree::new();
+        let key = 1;
+        let value = b"value".to_vec();
+        avl.insert(key, value.clone());
+        let retrieved = avl.get(&key);
+        assert_eq!(retrieved.unwrap(), value);
     }
 
     #[test]
-    fn insert_ordered_sequence() {
-        let mut avl = AVL::new();
-        for key in 0..100 {
-            avl.insert(key, key);
+    fn insert_sorted_sequence() {
+        let mut avl = AVLtree::new();
+        let value = b"value".to_vec();
+        for key in (1..100).collect::<Vec<i32>>() {
+            avl.insert(key, value.clone());
         }
 
-        for key in 0..100 {
-            assert_ne!(avl.get(&key), None);
+        for key in (1..100).collect::<Vec<i32>>() {
+            assert_eq!(avl.get(&key).unwrap(), value.clone());
         }
-        assert!(check_correctness(avl.root.as_ref().unwrap()));
+
+        assert!(check_correctness(&avl.root.unwrap()));
     }
 
     #[test]
-    fn insert_reverse_ordered_sequence() {
-        let mut avl = AVL::new();
-        for key in (0..100).rev() {
-            avl.insert(key, key);
+    fn insert_reverse_sorted_sequence() {
+        let mut avl = AVLtree::new();
+        let value = b"value".to_vec();
+        for key in (1..100).rev().collect::<Vec<i32>>() {
+            avl.insert(key, value.clone());
         }
 
-        for key in 0..100 {
-            assert_ne!(avl.get(&key), None);
+        for key in (1..100).collect::<Vec<i32>>() {
+            assert_eq!(avl.get(&key).unwrap(), value.clone());
         }
-        assert!(check_correctness(avl.root.as_ref().unwrap()));
+
+        assert!(check_correctness(&avl.root.unwrap()));
     }
 
     #[test]
-    fn insert_erase_find() {
-        let mut avl = AVL::new();
-        for key in 0..100 {
-            avl.insert(key, key);
-        }
-
-        for key in 0..100 {
-            avl.remove(&key);
-        }
-
-        for key in 0..100 {
-            assert_eq!(avl.get(&key), None);
-        }
+    fn test_get_nonexistent() {
+        let mut avl = AVLtree::new();
+        let value = b"value".to_vec();
+        avl.insert(1, value.clone());
+        avl.insert(2, value.clone());
+        avl.insert(3, value.clone());
+        let key = 5;
+        assert!(avl.get(&key).is_err());
     }
 
     #[test]
-    fn chek_iter() {
-        let mut avl = AVL::new();
-        for key in 0..100 {
-            avl.insert(key, key);
+    fn test_flush() -> io::Result<()> {
+        let mut avl = AVLtree::new();
+        let value1 = b"Value1".to_vec();
+        let value2 = b"Value2".to_vec();
+        let value3 = b"Value3".to_vec();
+        avl.insert(1, value1.clone());
+        avl.insert(2, value2.clone());
+        avl.insert(3, value3.clone());
+
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        avl.flush(path.clone())?;
+        let mut file = File::open(&temp_file)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+
+        let expected = [value1.clone(), value2.clone(), value3.clone()].concat();
+        assert_eq!(buffer, expected);
+
+        if let Some(root) = &avl.root {
+            assert_eq!(root.get_value().unwrap(), value2);
+            match &root.value {
+                Data::Pointer(p, _pos, len) => {
+                    assert_eq!(p, &path);
+                    assert_eq!(*len, value2.len());
+                }
+                _ => panic!("Expected Data::Pointer"),
+            }
+            if let Some(left) = &root.left_child {
+                assert_eq!(left.get_value().unwrap(), value1);
+                match &left.value {
+                    Data::Pointer(p, _pos, len) => {
+                        assert_eq!(p, &path);
+                        assert_eq!(*len, value1.len());
+                    }
+                    _ => panic!("Expected Data::Pointer"),
+                }
+            }
+            if let Some(right) = &root.right_child {
+                assert_eq!(right.get_value().unwrap(), value3);
+                match &right.value {
+                    Data::Pointer(p, _pos, len) => {
+                        assert_eq!(p, &path);
+                        assert_eq!(*len, value3.len());
+                    }
+                    _ => panic!("Expected Data::Pointer"),
+                }
+            }
+        } else {
+            panic!("Root should not be None after flush");
         }
-        
-        for (actual, expected) in zip(avl.iter(), 0..100) {
-            assert_eq!(actual, (&expected, &expected));
-        }
+
+        Ok(())
     }
 }
