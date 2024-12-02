@@ -1,2 +1,2 @@
 mod avl_tree;
-mod lsm_tree;
+pub mod lsm_tree;

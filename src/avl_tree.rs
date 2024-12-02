@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::{cmp, io};
 
 #[derive(Debug, Clone)]
 enum Data {
     Value(Vec<u8>),
-    Pointer(String, u64, usize),
+    Pointer(PathBuf, u64, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -25,7 +26,7 @@ pub struct AVLtree<K> {
 }
 
 #[allow(dead_code)]
-impl<K: Ord + Clone> AVLtree<K> {
+impl<K: Ord> AVLtree<K> {
     pub fn new() -> Self {
         AVLtree {
             root: None,
@@ -38,7 +39,11 @@ impl<K: Ord + Clone> AVLtree<K> {
     }
 
     pub fn insert(&mut self, key: K, value: Vec<u8>) {
-        self.root = Some(Node::insert(self.root.take(), key, value));
+        let result = Node::insert(self.root.take(), key, value);
+        self.root = Some(result.0);
+        if result.1 {
+            self.size += 1;
+        }
     }
 
     pub fn get(&self, key: &K) -> io::Result<Vec<u8>> {
@@ -55,28 +60,25 @@ impl<K: Ord + Clone> AVLtree<K> {
         }
     }
 
-    pub fn flush(&mut self, path: String) -> io::Result<()> {
+    pub fn flush(&mut self, path: &Path) -> io::Result<()> {
         let mut buffer = Vec::<u8>::new();
         match self.root.take() {
             None => Ok(()),
-            Some(root) => {
-                let flush_result = Node::flush(root, &path, 0, &mut buffer);
-                match flush_result {
-                    Err(e) => Err(e),
-                    Ok(result) => {
-                        self.root = result.0;
-                        let mut file = File::create(path)?;
-                        file.write_all(&buffer)?;
-                        Ok(())
-                    }
+            Some(root) => match Node::flush(root, path, 0, &mut buffer) {
+                Err(e) => Err(e),
+                Ok(result) => {
+                    self.root = result.0;
+                    let mut file = File::create(path)?;
+                    file.write_all(&buffer)?;
+                    Ok(())
                 }
-            }
+            },
         }
     }
 }
 
 #[allow(dead_code)]
-impl<K: Ord + Clone> Node<K> {
+impl<K: Ord> Node<K> {
     fn new(key: K, value: Vec<u8>) -> Self {
         Node {
             key,
@@ -95,7 +97,7 @@ impl<K: Ord + Clone> Node<K> {
 
                 file.seek(io::SeekFrom::Start(*position))?;
                 let mut value = vec![0; *size];
-                file.read(&mut value)?;
+                file.read_exact(&mut value)?;
                 Ok(value)
             }
         }
@@ -175,26 +177,30 @@ impl<K: Ord + Clone> Node<K> {
         }
     }
 
-    fn insert(node: Option<Box<Node<K>>>, key: K, value: Vec<u8>) -> Box<Node<K>> {
+    fn insert(node: Option<Box<Node<K>>>, key: K, value: Vec<u8>) -> (Box<Node<K>>, bool) {
         if node.is_none() {
-            return Box::new(Self::new(key, value));
+            return (Box::new(Self::new(key, value)), true);
         }
         let mut node = node.unwrap();
+        let mut inserted = true;
         match key.cmp(&node.key) {
             Ordering::Less => {
                 let result = Self::insert(node.left_child, key, value);
-                node.left_child = Some(result);
+                inserted &= result.1;
+                node.left_child = Some(result.0);
             }
             Ordering::Equal => {
                 node.value = Data::Value(value);
+                return (node, false);
             }
             Ordering::Greater => {
                 let result = Self::insert(node.right_child, key, value);
-                node.right_child = Some(result);
+                inserted &= result.1;
+                node.right_child = Some(result.0);
             }
         };
         node.update_height();
-        Self::balance(node)
+        (Self::balance(node), inserted)
     }
 
     fn get(&self, key: &K) -> io::Result<Vec<u8>> {
@@ -220,19 +226,11 @@ impl<K: Ord + Clone> Node<K> {
         child.is_none()
     }
 
-    fn get_min(&self) -> Self {
-        if let Some(left_child) = &self.left_child {
-            return Node::get_min(left_child);
-        };
-
-        self.clone()
-    }
-
-    fn flush<'a>(
+    fn flush(
         mut node: Box<Node<K>>,
-        path: &String,
+        path: &Path,
         position: u64,
-        buffer: &'a mut Vec<u8>,
+        buffer: &mut Vec<u8>,
     ) -> io::Result<(Option<Box<Node<K>>>, u64)> {
         match node.value {
             Data::Pointer(_path, _position, _len) => Ok((None, 0)),
@@ -245,7 +243,7 @@ impl<K: Ord + Clone> Node<K> {
 
                 let len = value.len();
                 buffer.append(&mut value);
-                node.value = Data::Pointer(path.clone(), next_pos, len);
+                node.value = Data::Pointer(path.to_path_buf(), next_pos, len);
                 next_pos += len as u64;
 
                 if let Some(right_child) = node.right_child {
@@ -345,7 +343,7 @@ mod avl_tests {
     }
 
     #[test]
-    fn test_get_nonexistent() {
+    fn get_nonexistent() {
         let mut avl = AVLtree::new();
         let value = b"value".to_vec();
         avl.insert(1, value.clone());
@@ -366,9 +364,9 @@ mod avl_tests {
         avl.insert(3, value3.clone());
 
         let temp_file = NamedTempFile::new()?;
-        let path = temp_file.path().to_str().unwrap().to_string();
+        let path = temp_file.path();
 
-        avl.flush(path.clone())?;
+        avl.flush(path)?;
         let mut file = File::open(&temp_file)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
