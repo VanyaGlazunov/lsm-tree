@@ -233,7 +233,7 @@ impl<K: Ord> Node<K> {
         buffer: &mut Vec<u8>,
     ) -> io::Result<(Option<Box<Node<K>>>, u64)> {
         match node.value {
-            Data::Pointer(_path, _position, _len) => Ok((None, 0)),
+            Data::Pointer(ref _path, _position, _len) => Ok((Some(node), position)),
             Data::Value(mut value) => {
                 let mut next_pos = position;
                 if let Some(left_child) = node.left_child {

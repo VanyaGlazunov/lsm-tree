@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 tempfile = "3.2"
+chunkfs = { git = "https://github.com/Piletskii-Oleg/chunkfs.git", branch = "master", features = ["chunkers", "hashers"] }
