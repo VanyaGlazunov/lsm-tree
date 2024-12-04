@@ -25,7 +25,6 @@ pub struct AVLtree<K> {
     size: u32,
 }
 
-#[allow(dead_code)]
 impl<K: Ord> AVLtree<K> {
     pub fn new() -> Self {
         AVLtree {
@@ -77,7 +76,6 @@ impl<K: Ord> AVLtree<K> {
     }
 }
 
-#[allow(dead_code)]
 impl<K: Ord> Node<K> {
     fn new(key: K, value: Vec<u8>) -> Self {
         Node {

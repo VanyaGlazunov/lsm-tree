@@ -29,7 +29,7 @@ impl<K: Ord> LSMtree<K> {
         self.memtable.insert(key, value);
 
         if self.memtable.size() > prev_size && self.memtable.size() % self.memtable_threshold == 0 {
-            let flush_path = self.path.join(format!("flust_{0}", self.flush_count));
+            let flush_path = self.path.join(format!("flush_{0}", self.flush_count));
             File::create(flush_path.as_path())?;
             self.memtable.flush(flush_path.as_path())?;
             self.flush_count += 1;
