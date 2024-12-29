@@ -1,19 +1,17 @@
 use std::cmp::Ordering;
-use std::fs::File;
-use std::io::{ErrorKind, Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
 use std::{cmp, io};
 
-#[derive(Debug, Clone)]
-enum Data {
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeData {
     Value(Vec<u8>),
-    Pointer(PathBuf, u64, usize),
+    Pointer(usize, usize, usize),
 }
 
 #[derive(Debug, Clone)]
 struct Node<K> {
     key: K,
-    value: Data,
+    value: NodeData,
     height: i8,
     left_child: Option<Box<Node<K>>>,
     right_child: Option<Box<Node<K>>>,
@@ -22,7 +20,7 @@ struct Node<K> {
 #[derive(Debug)]
 pub struct AVLtree<K> {
     root: Option<Box<Node<K>>>,
-    size: u32,
+    size: usize,
 }
 
 impl<K: Ord> AVLtree<K> {
@@ -33,19 +31,20 @@ impl<K: Ord> AVLtree<K> {
         }
     }
 
-    pub fn size(&self) -> u32 {
+    pub fn size(&self) -> usize {
         self.size
     }
 
     pub fn insert(&mut self, key: K, value: Vec<u8>) {
+        let value_size = value.len();
         let result = Node::insert(self.root.take(), key, value);
         self.root = Some(result.0);
         if result.1 {
-            self.size += 1;
+            self.size += value_size;
         }
     }
 
-    pub fn get(&self, key: &K) -> io::Result<Vec<u8>> {
+    pub fn get(&self, key: &K) -> io::Result<NodeData> {
         match &self.root {
             Some(root) => root.get(key),
             None => Err(ErrorKind::NotFound.into()),
@@ -59,19 +58,15 @@ impl<K: Ord> AVLtree<K> {
         }
     }
 
-    pub fn flush(&mut self, path: &Path) -> io::Result<()> {
+    pub fn flush(&mut self, table_index: usize) -> Option<Vec<u8>> {
         let mut buffer = Vec::<u8>::new();
         match self.root.take() {
-            None => Ok(()),
-            Some(root) => match Node::flush(root, path, 0, &mut buffer) {
-                Err(e) => Err(e),
-                Ok(result) => {
-                    self.root = result.0;
-                    let mut file = File::create(path)?;
-                    file.write_all(&buffer)?;
-                    Ok(())
-                }
-            },
+            None => None,
+            Some(root) => {
+                self.root = Node::flush(root, table_index, 0, &mut buffer).0;
+                self.size = 0;
+                Some(buffer)
+            }
         }
     }
 }
@@ -80,24 +75,10 @@ impl<K: Ord> Node<K> {
     fn new(key: K, value: Vec<u8>) -> Self {
         Node {
             key,
-            value: Data::Value(value),
+            value: NodeData::Value(value),
             height: 1,
             left_child: None,
             right_child: None,
-        }
-    }
-
-    fn get_value(&self) -> io::Result<Vec<u8>> {
-        match &self.value {
-            Data::Value(value) => Ok(value.clone()),
-            Data::Pointer(path, position, size) => {
-                let mut file = File::open(path)?;
-
-                file.seek(io::SeekFrom::Start(*position))?;
-                let mut value = vec![0; *size];
-                file.read_exact(&mut value)?;
-                Ok(value)
-            }
         }
     }
 
@@ -188,7 +169,7 @@ impl<K: Ord> Node<K> {
                 node.left_child = Some(result.0);
             }
             Ordering::Equal => {
-                node.value = Data::Value(value);
+                node.value = NodeData::Value(value);
                 return (node, false);
             }
             Ordering::Greater => {
@@ -201,10 +182,10 @@ impl<K: Ord> Node<K> {
         (Self::balance(node), inserted)
     }
 
-    fn get(&self, key: &K) -> io::Result<Vec<u8>> {
+    fn get(&self, key: &K) -> io::Result<NodeData> {
         let child = match key.cmp(&self.key) {
             Ordering::Less => &self.left_child,
-            Ordering::Equal => return self.get_value(),
+            Ordering::Equal => return Ok(self.value.clone()),
             Ordering::Greater => &self.right_child,
         };
 
@@ -226,30 +207,30 @@ impl<K: Ord> Node<K> {
 
     fn flush(
         mut node: Box<Node<K>>,
-        path: &Path,
-        position: u64,
+        table_index: usize,
+        position: usize,
         buffer: &mut Vec<u8>,
-    ) -> io::Result<(Option<Box<Node<K>>>, u64)> {
+    ) -> (Option<Box<Node<K>>>, usize) {
         match node.value {
-            Data::Pointer(ref _path, _position, _len) => Ok((Some(node), position)),
-            Data::Value(mut value) => {
+            NodeData::Pointer(ref _path, _position, _len) => (Some(node), position),
+            NodeData::Value(mut value) => {
                 let mut next_pos = position;
                 if let Some(left_child) = node.left_child {
                     (node.left_child, next_pos) =
-                        Node::flush(left_child, path, next_pos, buffer).unwrap();
+                        Node::flush(left_child, table_index, next_pos, buffer);
                 }
 
                 let len = value.len();
                 buffer.append(&mut value);
-                node.value = Data::Pointer(path.to_path_buf(), next_pos, len);
-                next_pos += len as u64;
+                node.value = NodeData::Pointer(table_index, next_pos, len);
+                next_pos += len;
 
                 if let Some(right_child) = node.right_child {
                     (node.right_child, next_pos) =
-                        Node::flush(right_child, path, next_pos, buffer).unwrap();
+                        Node::flush(right_child, table_index, next_pos, buffer);
                 }
 
-                Ok((Some(node), next_pos))
+                (Some(node), next_pos)
             }
         }
     }
@@ -258,7 +239,6 @@ impl<K: Ord> Node<K> {
 #[cfg(test)]
 mod avl_tests {
     use super::*;
-    use tempfile::{self, NamedTempFile};
 
     fn get_height<K>(avl_node: &Node<K>) -> i32 {
         let mut max_height = 0;
@@ -307,7 +287,7 @@ mod avl_tests {
         let value = b"value".to_vec();
         avl.insert(key, value.clone());
         let retrieved = avl.get(&key);
-        assert_eq!(retrieved.unwrap(), value);
+        assert_eq!(retrieved.unwrap(), NodeData::Value(value));
     }
 
     #[test]
@@ -319,7 +299,7 @@ mod avl_tests {
         }
 
         for key in (1..100).collect::<Vec<i32>>() {
-            assert_eq!(avl.get(&key).unwrap(), value.clone());
+            assert_eq!(avl.get(&key).unwrap(), NodeData::Value(value.clone()));
         }
 
         assert!(check_correctness(&avl.root.unwrap()));
@@ -334,7 +314,7 @@ mod avl_tests {
         }
 
         for key in (1..100).collect::<Vec<i32>>() {
-            assert_eq!(avl.get(&key).unwrap(), value.clone());
+            assert_eq!(avl.get(&key).unwrap(), NodeData::Value(value.clone()));
         }
 
         assert!(check_correctness(&avl.root.unwrap()));
@@ -352,7 +332,7 @@ mod avl_tests {
     }
 
     #[test]
-    fn test_flush() -> io::Result<()> {
+    fn test_flush() {
         let mut avl = AVLtree::new();
         let value1 = b"Value1".to_vec();
         let value2 = b"Value2".to_vec();
@@ -361,50 +341,23 @@ mod avl_tests {
         avl.insert(2, value2.clone());
         avl.insert(3, value3.clone());
 
-        let temp_file = NamedTempFile::new()?;
-        let path = temp_file.path();
-
-        avl.flush(path)?;
-        let mut file = File::open(&temp_file)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
+        let buffer = avl.flush(0).unwrap();
 
         let expected = [value1.clone(), value2.clone(), value3.clone()].concat();
         assert_eq!(buffer, expected);
 
         if let Some(root) = &avl.root {
-            assert_eq!(root.get_value().unwrap(), value2);
-            match &root.value {
-                Data::Pointer(p, _pos, len) => {
-                    assert_eq!(p, &path);
-                    assert_eq!(*len, value2.len());
-                }
-                _ => panic!("Expected Data::Pointer"),
+            assert_eq!(root.value, NodeData::Pointer(0, 6, 6));
+            match &root.left_child {
+                Some(left) => assert_eq!(left.value, NodeData::Pointer(0, 0, 6)),
+                None => panic!("Left node should not be None after flush"),
             }
-            if let Some(left) = &root.left_child {
-                assert_eq!(left.get_value().unwrap(), value1);
-                match &left.value {
-                    Data::Pointer(p, _pos, len) => {
-                        assert_eq!(p, &path);
-                        assert_eq!(*len, value1.len());
-                    }
-                    _ => panic!("Expected Data::Pointer"),
-                }
-            }
-            if let Some(right) = &root.right_child {
-                assert_eq!(right.get_value().unwrap(), value3);
-                match &right.value {
-                    Data::Pointer(p, _pos, len) => {
-                        assert_eq!(p, &path);
-                        assert_eq!(*len, value3.len());
-                    }
-                    _ => panic!("Expected Data::Pointer"),
-                }
+            match &root.right_child {
+                Some(right) => assert_eq!(right.value, NodeData::Pointer(0, 12, 6)),
+                None => panic!("Right node should not be None after flush"),
             }
         } else {
             panic!("Root should not be None after flush");
         }
-
-        Ok(())
     }
 }

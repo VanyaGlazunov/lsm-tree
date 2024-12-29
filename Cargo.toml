@@ -5,4 +5,10 @@ edition = "2021"
 
 [dependencies]
 tempfile = "3.2"
-chunkfs = { git = "https://github.com/Piletskii-Oleg/chunkfs.git", branch = "master", features = ["chunkers", "hashers"] }
+chunkfs = { git = "https://github.com/Piletskii-Oleg/chunkfs.git", branch = "main", features = ["chunkers", "hashers"] }
+bplus_tree = { git = "https://github.com/kamenkremen/BPlusTree.git", branch = "Prototype1" }
+criterion = "0.5"
+
+[[bench]]
+name = "write_read"
+harness = false
