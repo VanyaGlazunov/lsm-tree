@@ -12,18 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust (Windows)
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
+          toolchain: stable
           components: rustfmt, clippy
-          target: x86_64-pc-windows-msvc  # Only needed for Windows
+          target: x86_64-pc-windows-msvc
         if: matrix.os == 'windows-latest'
 
       - name: Install Rust (Linux)
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
+          toolchain: stable
           components: rustfmt, clippy
         if: matrix.os == 'ubuntu-latest'
 
