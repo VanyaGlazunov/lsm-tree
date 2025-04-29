@@ -86,7 +86,6 @@ async fn flush_worker<M: Memtable + Send + Sync + 'static>(
 ) {
     let semaphore = Box::new(Semaphore::new(num_flush_jobs));
     let semaphore = Box::leak(semaphore);
-    dbg!("Start WORKER");
     loop {
         tokio::select! {
             Some(memtable) = receiver.recv() => {
@@ -130,7 +129,6 @@ async fn flush_worker<M: Memtable + Send + Sync + 'static>(
             }
         }
     }
-    // panic!();
 }
 
 
@@ -159,7 +157,6 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
             let records: Vec<ManifestRecord>;
             (manifest, records) = Manifest::recover(manifest_path)?;
             let mut memtables = BTreeSet::<usize>::new();
-            dbg!(&records);
             for record in records {
                 match record {
                     ManifestRecord::NewMemtable(id) => {
@@ -320,7 +317,6 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         let key = key.as_ref();
 
         let mut candidate = guard.memtable.get(key);
-        // dbg!(&guard.sstables);
         if candidate.is_some()  {
             if candidate == Some(TOMBSTONE) {
                 return None;
