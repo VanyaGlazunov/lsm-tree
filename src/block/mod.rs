@@ -49,7 +49,7 @@ pub struct BlockIterator<'a> {
     current_idx: usize,
 }
 
-impl<'a> BlockIterator<'a> {
+impl BlockIterator<'_> {
     /// Seeks to the first entry with key >= target
     pub fn seek(&mut self, target: &[u8]) {
         self.current_idx = self.offsets.partition_point(|&offset| {
@@ -61,7 +61,7 @@ impl<'a> BlockIterator<'a> {
     }
 }
 
-impl<'a> Iterator for BlockIterator<'a> {
+impl Iterator for BlockIterator<'_> {
     type Item = (Bytes, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {

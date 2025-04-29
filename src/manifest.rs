@@ -24,6 +24,7 @@ impl Manifest {
             file: Arc::new(Mutex::new(
                 OpenOptions::new()
                     .create(true)
+                    .truncate(true)
                     .write(true)
                     .open(path)
                     .context("Failed to create manifest file")?,

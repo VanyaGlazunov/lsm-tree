@@ -1,8 +1,14 @@
 use std::{
-    collections::{BTreeSet, HashMap}, fs::create_dir_all, mem, path::{Path, PathBuf}, sync::{
+    collections::{BTreeSet, HashMap},
+    fs::create_dir_all,
+    mem,
+    path::{Path, PathBuf},
+    sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
-    }, thread::sleep, time::Duration
+    },
+    thread::sleep,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -53,7 +59,7 @@ struct LSMStorageInner<M: Memtable + Send + Sync + 'static> {
     flush_sender: tokio::sync::mpsc::Sender<M>,
     flush_handle: JoinHandle<()>,
     flush_notifier: Arc<Notify>,
-    flush_complete_notify: Arc<Notify>
+    flush_complete_notify: Arc<Notify>,
 }
 
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
@@ -71,8 +77,8 @@ impl Default for LSMStorageOptions {
     }
 }
 
-
 // Needs refactoring...
+#[allow(clippy::too_many_arguments)]
 async fn flush_worker<M: Memtable + Send + Sync + 'static>(
     data: Arc<RwLock<LSMData<M>>>,
     block_size: usize,
@@ -131,8 +137,6 @@ async fn flush_worker<M: Memtable + Send + Sync + 'static>(
     }
 }
 
-
-
 fn get_sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
     path.as_ref().to_path_buf().join(format!("{id}.sst"))
 }
@@ -143,7 +147,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         let mut l0_tables = Vec::<usize>::new();
         let mut sstables = HashMap::<usize, SSTable>::new();
 
-        let mut next_sst_id = 0 as usize;
+        let mut next_sst_id = 0_usize;
 
         if !path.exists() {
             create_dir_all(path).context("Failed to create DB directory")?;
@@ -173,7 +177,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
                     }
                 }
             }
-            next_sst_id = next_sst_id + 1;
+            next_sst_id += 1;
             for id in &l0_tables {
                 let sstable_path = get_sst_path(path, *id);
                 let sstable = SSTable::open(&sstable_path)
@@ -194,33 +198,41 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
             sstables,
         }));
         let manifest = Arc::new(Mutex::new(manifest));
-        let (active_flush_tasks, flush_notifier, flush_complete_notifier, handle, sender) = LSMStorageInner::spawn_flush_worker(
-            data.clone(),
-            &options,
-            manifest.clone(),
-            path.to_path_buf(),
-        );
+        let (active_flush_tasks, flush_notifier, flush_complete_notifier, handle, sender) =
+            LSMStorageInner::spawn_flush_worker(
+                data.clone(),
+                &options,
+                manifest.clone(),
+                path.to_path_buf(),
+            );
 
         Ok(LSMStorageInner {
-            data: data,
+            data,
             path: path.to_path_buf(),
             next_sst_id: AtomicUsize::new(next_sst_id),
             options: Arc::new(options),
-            manifest: manifest,
+            manifest,
             active_flush_tasks,
             flush_sender: sender,
             flush_handle: handle,
-            flush_notifier: flush_notifier,
+            flush_notifier,
             flush_complete_notify: flush_complete_notifier,
         })
     }
 
+    #[allow(clippy::type_complexity)]
     fn spawn_flush_worker(
         data: Arc<RwLock<LSMData<M>>>,
         options: &LSMStorageOptions,
         manifest: Arc<Mutex<Manifest>>,
         path: PathBuf,
-    ) -> (Arc<AtomicUsize>, Arc<Notify>, Arc<Notify>, JoinHandle<()>, tokio::sync::mpsc::Sender<M>) {
+    ) -> (
+        Arc<AtomicUsize>,
+        Arc<Notify>,
+        Arc<Notify>,
+        JoinHandle<()>,
+        tokio::sync::mpsc::Sender<M>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
         let path = Arc::new(path);
         let active_flush_tasks = Arc::new(AtomicUsize::new(0));
@@ -239,7 +251,13 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
             options.num_flush_jobs,
         ));
 
-        (active_flush_tasks, flush_notifier, flush_complete_notify, handle, tx)
+        (
+            active_flush_tasks,
+            flush_notifier,
+            flush_complete_notify,
+            handle,
+            tx,
+        )
     }
 
     /// Waits for all flushes to be done then closes db.
@@ -255,7 +273,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         let memtable = std::mem::replace(&mut guard.memtable, M::new(0));
         guard.imm_memtables.insert(id, memtable);
 
-        for (_, memtable) in &guard.imm_memtables {
+        for memtable in guard.imm_memtables.values() {
             if memtable.size_estimate() == 0 {
                 continue;
             }
@@ -282,21 +300,21 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         }
         let mut guard = self.data.write().await;
 
-        guard
-            .memtable
-            .set(Bytes::copy_from_slice(key), value);
+        guard.memtable.set(Bytes::copy_from_slice(key), value);
 
         if guard.memtable.size_estimate() > self.options.memtables_size {
             let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
             let new_memtable = M::new(old_id + 1);
             let old_memtable = mem::replace(&mut guard.memtable, new_memtable);
-            guard
-                .imm_memtables
-                .insert(old_id, old_memtable.clone());
+            guard.imm_memtables.insert(old_id, old_memtable.clone());
 
             {
                 // TODO: Propper handling of channel overflow.
-                self.manifest.lock().await.add_record(ManifestRecord::NewMemtable(old_id)).unwrap();
+                self.manifest
+                    .lock()
+                    .await
+                    .add_record(ManifestRecord::NewMemtable(old_id))
+                    .unwrap();
             }
 
             // TODO: Propper handling of channel overflow.
@@ -317,7 +335,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         let key = key.as_ref();
 
         let mut candidate = guard.memtable.get(key);
-        if candidate.is_some()  {
+        if candidate.is_some() {
             if candidate == Some(TOMBSTONE) {
                 return None;
             } else {
@@ -325,10 +343,10 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
             }
         }
 
-        for (_, memtable) in &guard.imm_memtables {
+        for memtable in guard.imm_memtables.values() {
             match memtable.get(key) {
                 None => continue,
-                Some(val) => candidate = Some(val)
+                Some(val) => candidate = Some(val),
             }
         }
 
@@ -346,7 +364,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
             // TODO: Propper error handling
             match try_get_value {
                 Ok(maybe_value) => {
-                    if maybe_value.is_some()  {
+                    if maybe_value.is_some() {
                         candidate = maybe_value;
                     }
                 }
@@ -361,7 +379,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
             return candidate;
         }
 
-        return None;
+        None
     }
 }
 
@@ -405,10 +423,10 @@ mod lsm_storage_tests {
     async fn test_basic_crud() -> Result<()> {
         let dir = tempdir()?;
         let mut storage = Storage::open(&dir, LSMStorageOptions::default())?;
-        
+
         storage.insert(b"key1", Bytes::from("val1")).await;
         assert_eq!(storage.get(&b"key1").await, Some(Bytes::from("val1")));
-        
+
         storage.delete(&b"key1").await;
         assert_eq!(storage.get(&b"key1").await, None);
         Ok(())
@@ -431,15 +449,18 @@ mod lsm_storage_tests {
     #[tokio::test]
     async fn test_flush_recovery() -> Result<()> {
         let dir = tempdir()?;
-        let mut storage = Storage::open(&dir, LSMStorageOptions {
-            memtables_size: 1,
-            ..Default::default()
-        })?;
-        
+        let mut storage = Storage::open(
+            &dir,
+            LSMStorageOptions {
+                memtables_size: 1,
+                ..Default::default()
+            },
+        )?;
+
         storage.insert(b"flushed", Bytes::from("value")).await;
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait for flush
         storage.close().await.unwrap();
-        
+
         let storage = Storage::open(&dir, LSMStorageOptions::default())?;
         assert_eq!(storage.get(&b"flushed").await, Some(Bytes::from("value")));
         Ok(())

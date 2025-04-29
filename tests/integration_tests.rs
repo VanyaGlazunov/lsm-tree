@@ -1,10 +1,10 @@
+use anyhow::Result;
 use bytes::Bytes;
-use lsm_tree::{lsm_storage::LSMStorageOptions, memtable::BtreeMapMemtable};
 use lsm_tree::lsm_storage::LSMStorage;
+use lsm_tree::{lsm_storage::LSMStorageOptions, memtable::BtreeMapMemtable};
 use proptest::prelude::*;
 use std::{collections::BTreeMap, sync::Arc};
 use tempfile::tempdir;
-use anyhow::Result;
 
 type Storage = LSMStorage<BtreeMapMemtable>;
 
@@ -12,15 +12,13 @@ fn operation_strategy() -> impl Strategy<Value = Vec<(Vec<u8>, Option<Vec<u8>>)>
     prop::collection::vec(
         (
             prop::collection::vec(any::<u8>(), 1..2024),
-            (any::<bool>(), prop::collection::vec(any::<u8>(), 1..2024)), 
+            (any::<bool>(), prop::collection::vec(any::<u8>(), 1..2024)),
         ),
-        1..100 // Number of operations
+        1..100, // Number of operations
     )
     .prop_map(|ops| {
         ops.into_iter()
-            .map(|(key, (delete, value))| {
-                (key, if delete { None } else { Some(value) })
-            })
+            .map(|(key, (delete, value))| (key, if delete { None } else { Some(value) }))
             .collect()
     })
 }
@@ -72,9 +70,10 @@ proptest! {
 #[tokio::test]
 async fn test_concurrent_access() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Arc::new(tokio::sync::Mutex::new(
-        Storage::open(&dir, LSMStorageOptions::default())?
-    ));
+    let storage = Arc::new(tokio::sync::Mutex::new(Storage::open(
+        &dir,
+        LSMStorageOptions::default(),
+    )?));
 
     let mut handles = vec![];
     for i in 0..10 {
@@ -82,8 +81,15 @@ async fn test_concurrent_access() -> Result<()> {
         handles.push(tokio::spawn(async move {
             for j in 0..100 {
                 let key = format!("key-{i}-{j}").into_bytes();
-                storage.lock().await.insert(&key, Bytes::from("value")).await;
-                assert_eq!(storage.lock().await.get(&key).await, Some(Bytes::from("value")));
+                storage
+                    .lock()
+                    .await
+                    .insert(&key, Bytes::from("value"))
+                    .await;
+                assert_eq!(
+                    storage.lock().await.get(&key).await,
+                    Some(Bytes::from("value"))
+                );
             }
         }));
     }
@@ -141,16 +147,15 @@ async fn test_flush_race_conditions() -> Result<()> {
 
     // Insert enough data to trigger multiple flushes
     for i in 0..100 {
-        storage.insert(format!("key-{}", i).as_bytes(), Bytes::from("value")).await;
+        storage
+            .insert(format!("key-{}", i).as_bytes(), Bytes::from("value"))
+            .await;
     }
 
     // Verify all data while flushes are happening
     for i in 0..100 {
         let key = format!("key-{}", i).into_bytes();
-        assert_eq!(
-            storage.get(&key).await,
-            Some(Bytes::from("value"))
-        );
+        assert_eq!(storage.get(&key).await, Some(Bytes::from("value")));
     }
 
     storage.close().await?;
@@ -159,10 +164,7 @@ async fn test_flush_race_conditions() -> Result<()> {
     let storage = Storage::open(&dir, LSMStorageOptions::default())?;
     for i in 0..100 {
         let key = format!("key-{}", i).into_bytes();
-        assert_eq!(
-            storage.get(&key).await,
-            Some(Bytes::from("value"))
-        );
+        assert_eq!(storage.get(&key).await, Some(Bytes::from("value")));
     }
 
     Ok(())

@@ -1,8 +1,4 @@
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    path::Path,
-};
+use std::{fs::OpenOptions, io::Write, path::Path};
 
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes};
@@ -79,7 +75,7 @@ impl SSTableBuilder {
             buf.put_slice(&block_meta.last_key);
         }
 
-        buf.into()
+        buf
     }
 
     /// Builds sst from added data and writes it on disk ans syncs; returns built sst.
@@ -90,6 +86,7 @@ impl SSTableBuilder {
             .write(true)
             .read(true)
             .create(true)
+            .truncate(true)
             .open(path)
             .context("Failed to create file for SSTable")?;
 
