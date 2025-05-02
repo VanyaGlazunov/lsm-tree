@@ -42,14 +42,14 @@ pub struct LSMStorageOptions {
     pub num_flush_jobs: usize,
 }
 
-struct LSMData<M: Memtable> {
+pub(crate) struct LSMData<M: Memtable> {
     memtable: M,
     imm_memtables: HashMap<usize, M>,
     l0_tables: Vec<usize>,
     sstables: HashMap<usize, SSTable>,
 }
 
-struct LSMStorageInner<M: Memtable + Send + Sync + 'static> {
+pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     path: PathBuf,
     data: Arc<RwLock<LSMData<M>>>,
     options: Arc<LSMStorageOptions>,
@@ -60,10 +60,6 @@ struct LSMStorageInner<M: Memtable + Send + Sync + 'static> {
     flush_handle: JoinHandle<()>,
     flush_notifier: Arc<Notify>,
     flush_complete_notify: Arc<Notify>,
-}
-
-pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
-    inner: LSMStorageInner<M>,
 }
 
 impl Default for LSMStorageOptions {
@@ -141,8 +137,8 @@ fn get_sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
     path.as_ref().to_path_buf().join(format!("{id}.sst"))
 }
 
-impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
-    fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
+impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
+    pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let mut l0_tables = Vec::<usize>::new();
         let mut sstables = HashMap::<usize, SSTable>::new();
@@ -199,14 +195,9 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         }));
         let manifest = Arc::new(Mutex::new(manifest));
         let (active_flush_tasks, flush_notifier, flush_complete_notifier, handle, sender) =
-            LSMStorageInner::spawn_flush_worker(
-                data.clone(),
-                &options,
-                manifest.clone(),
-                path.to_path_buf(),
-            );
+            Self::spawn_flush_worker(data.clone(), &options, manifest.clone(), path.to_path_buf());
 
-        Ok(LSMStorageInner {
+        Ok(Self {
             data,
             path: path.to_path_buf(),
             next_sst_id: AtomicUsize::new(next_sst_id),
@@ -261,7 +252,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
     }
 
     /// Waits for all flushes to be done then closes db.
-    async fn close(self) -> Result<()> {
+    pub async fn close(self) -> Result<()> {
         while self.active_flush_tasks.load(Ordering::SeqCst) > 0 {
             self.flush_complete_notify.notified().await;
         }
@@ -292,7 +283,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         Ok(())
     }
 
-    async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) {
+    pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) {
         let key = key.as_ref();
         // TODO: Propper handling of channel overflow.
         if key.is_empty() {
@@ -330,7 +321,7 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
         }
     }
 
-    async fn get(&self, key: &impl AsRef<[u8]>) -> Option<Bytes> {
+    pub async fn get(&self, key: &impl AsRef<[u8]>) -> Option<Bytes> {
         let guard = self.data.read().await;
         let key = key.as_ref();
 
@@ -381,31 +372,9 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorageInner<M> {
 
         None
     }
-}
-
-impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
-    /// Opens lsm storage from path or creates a new one.
-    pub fn open(path: &impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
-        Ok(Self {
-            inner: LSMStorageInner::open(path, options)?,
-        })
-    }
-
-    /// Hopefully closes db...
-    pub async fn close(self) -> Result<()> {
-        self.inner.close().await
-    }
-
-    pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) {
-        self.inner.insert(key, value).await;
-    }
-
-    pub async fn get(&self, key: &impl AsRef<[u8]>) -> Option<Bytes> {
-        self.inner.get(key).await
-    }
 
     pub async fn delete(&mut self, key: &impl AsRef<[u8]>) {
-        self.inner.insert(key, TOMBSTONE).await;
+        self.insert(key, TOMBSTONE).await;
     }
 }
 
