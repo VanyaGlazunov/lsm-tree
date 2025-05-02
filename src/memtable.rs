@@ -2,8 +2,6 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 
-use crate::sstable::builder::SSTableBuilder;
-
 pub trait Memtable {
     fn new(id: usize) -> Self;
     fn get(&self, key: &[u8]) -> Option<Bytes>;
@@ -11,14 +9,9 @@ pub trait Memtable {
     fn get_id(&self) -> usize;
     fn size_estimate(&self) -> usize;
     fn iter(&self) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + '_>;
-    fn flush(&self, builder: &mut SSTableBuilder) {
-        for (key, value) in self.iter() {
-            builder.add(key, value);
-        }
-    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BtreeMapMemtable {
     id: usize,
     container: BTreeMap<Bytes, Bytes>,

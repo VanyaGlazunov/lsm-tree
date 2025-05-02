@@ -7,15 +7,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    thread::sleep,
-    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{Mutex, Notify, RwLock, Semaphore},
+    sync::{mpsc::Receiver, Mutex, RwLock, Semaphore},
     task::JoinHandle,
 };
 
@@ -33,6 +31,7 @@ const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
 const DEFAULT_MEMTABLE_CAP: usize = 2;
 const DEFAULT_NUM_FLUSH_WORKERS: usize = 2;
 
+#[derive(Clone)]
 pub struct LSMStorageOptions {
     pub block_size: usize,
     pub memtables_size: usize,
@@ -42,24 +41,17 @@ pub struct LSMStorageOptions {
     pub num_flush_jobs: usize,
 }
 
-pub(crate) struct LSMData<M: Memtable> {
-    memtable: M,
-    imm_memtables: HashMap<usize, M>,
-    l0_tables: Vec<usize>,
-    sstables: HashMap<usize, SSTable>,
-}
-
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     path: PathBuf,
-    data: Arc<RwLock<LSMData<M>>>,
+    swap_lock: Mutex<()>,
+    memtable: Arc<RwLock<M>>,
+    imm_memtables: Arc<RwLock<HashMap<usize, M>>>,
+    l0_tables: Arc<RwLock<Vec<usize>>>,
+    sstables: Arc<RwLock<HashMap<usize, SSTable>>>,
     options: Arc<LSMStorageOptions>,
     next_sst_id: AtomicUsize,
     manifest: Arc<Mutex<Manifest>>,
-    active_flush_tasks: Arc<AtomicUsize>,
-    flush_sender: tokio::sync::mpsc::Sender<M>,
-    flush_handle: JoinHandle<()>,
-    flush_notifier: Arc<Notify>,
-    flush_complete_notify: Arc<Notify>,
+    flush_handle: FlushHandle<M>,
 }
 
 impl Default for LSMStorageOptions {
@@ -73,63 +65,91 @@ impl Default for LSMStorageOptions {
     }
 }
 
-// Needs refactoring...
-#[allow(clippy::too_many_arguments)]
-async fn flush_worker<M: Memtable + Send + Sync + 'static>(
-    data: Arc<RwLock<LSMData<M>>>,
-    block_size: usize,
+struct FlushSystem<M: Memtable + Send + Sync> {
+    imm_memtables: Arc<RwLock<HashMap<usize, M>>>,
+    l0_tables: Arc<RwLock<Vec<usize>>>,
+    sstables: Arc<RwLock<HashMap<usize, SSTable>>>,
     manifest: Arc<Mutex<Manifest>>,
-    mut receiver: tokio::sync::mpsc::Receiver<M>,
-    path: Arc<PathBuf>,
-    active_flush_tasks: Arc<AtomicUsize>,
-    flush_complete_notify: Arc<Notify>,
-    notify: Arc<Notify>,
-    num_flush_jobs: usize,
-) {
-    let semaphore = Box::new(Semaphore::new(num_flush_jobs));
-    let semaphore = Box::leak(semaphore);
-    loop {
-        tokio::select! {
-            Some(memtable) = receiver.recv() => {
-                let permit = semaphore.acquire().await;
-                active_flush_tasks.fetch_add(1, Ordering::SeqCst);
-                let data_clone = Arc::clone(&data);
-                let path_clone = Arc::clone(&path);
-                let manifest_clone = Arc::clone(&manifest);
-                let active_flush_tasks_clone = Arc::clone(&active_flush_tasks);
-                let flush_complete_notify_clone = Arc::clone(&flush_complete_notify);
+    path: PathBuf,
+    options: LSMStorageOptions,
+}
 
-                tokio::spawn(async move {
-                    let id = memtable.get_id();
-                    let sst_path = get_sst_path(path_clone.as_path(), id);
+struct FlushHandle<M: Memtable + Send + Sync + 'static> {
+    handle: JoinHandle<()>,
+    sender: tokio::sync::mpsc::Sender<FlushCommand<M>>,
+}
 
-                    let sst = {
-                        let mut builder = SSTableBuilder::new(block_size);
-                        memtable.flush(&mut builder);
-                        builder.build(sst_path).unwrap()
-                    };
+enum FlushCommand<M: Memtable + Send + Sync + 'static> {
+    Memtable(M),
+    Shutdown,
+}
 
-                    {
-                        let manifest = manifest_clone.lock().await;
-                        manifest.add_record(ManifestRecord::Flush(id)).unwrap();
+impl<M: Memtable + Send + Sync> FlushSystem<M> {
+    /// Spawns task with reciever for immutable memtables.
+    /// For each recieved memtable spawns task (number of tasks always <= flush_num_jobs) that
+    /// flushes it, writes metainfo into manifest, removes immutable memtable from LSMStorage, adds sstable to LSMStorage.
+    fn init(self) -> FlushHandle<M> {
+        let (tx, rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
+        let path = Arc::new(self.path);
+
+        let handle = tokio::spawn({
+            async move {
+                let semaphore = Arc::new(Semaphore::new(self.options.num_flush_jobs));
+                let mut receiver: Receiver<FlushCommand<M>> = rx;
+
+                while let Some(cmd) = receiver.recv().await {
+                    match cmd {
+                        FlushCommand::Memtable(memtable) => {
+                            let permit = match semaphore.clone().acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => break, // Semaphore closed
+                            };
+
+                            let imm_memtables = self.imm_memtables.clone();
+                            let l0_sstables = self.l0_tables.clone();
+                            let sstables = self.sstables.clone();
+                            let manifest = self.manifest.clone();
+                            let path = Arc::clone(&path);
+
+                            tokio::spawn(async move {
+                                let id = memtable.get_id();
+
+                                // TODO: Error handling
+                                let sst = flush_memtable(
+                                    self.options.block_size,
+                                    path.as_path(),
+                                    &memtable,
+                                )
+                                .await
+                                .unwrap();
+
+                                manifest
+                                    .lock()
+                                    .await
+                                    .add_record(ManifestRecord::Flush(id))
+                                    .unwrap();
+
+                                {
+                                    l0_sstables.write().await.push(id);
+                                    sstables.write().await.insert(id, sst);
+                                    imm_memtables.write().await.remove(&id);
+                                }
+
+                                drop(permit);
+                            });
+                        }
+                        FlushCommand::Shutdown => break,
                     }
+                }
 
-                    {
-                        let mut guard = data_clone.write().await;
-                        guard.l0_tables.push(id);
-                        guard.sstables.insert(id, sst);
-                        guard.imm_memtables.remove(&id);
-                    }
+                // Wait for remaining permits
+                let _ = semaphore
+                    .acquire_many(self.options.num_flush_jobs as u32)
+                    .await;
+            }
+        });
 
-                    active_flush_tasks_clone.fetch_sub(1, Ordering::SeqCst);
-                    flush_complete_notify_clone.notify_one();
-                    drop(permit);
-                });
-            }
-            _ = notify.notified() => {
-                break;
-            }
-        }
+        FlushHandle { handle, sender: tx }
     }
 }
 
@@ -137,7 +157,24 @@ fn get_sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
     path.as_ref().to_path_buf().join(format!("{id}.sst"))
 }
 
-impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
+/// Creates sstable from memtable via build method in SSTableBuilder.
+async fn flush_memtable(
+    block_size: usize,
+    path: impl AsRef<Path>,
+    memtable: &impl Memtable,
+) -> Result<SSTable> {
+    let mut builder = SSTableBuilder::new(block_size);
+    for (key, value) in memtable.iter() {
+        builder.add(key, value);
+    }
+
+    let id = memtable.get_id();
+    builder
+        .build(get_sst_path(path, id))
+        .context(format!("Failed to flush memtable. id: {id}"))
+}
+
+impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let mut l0_tables = Vec::<usize>::new();
@@ -149,7 +186,6 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
             create_dir_all(path).context("Failed to create DB directory")?;
         }
 
-        // Manifest path = path/MANIFEST
         let manifest_path = path.join("MANIFEST");
         let manifest;
         // recover sstables from manifest...
@@ -187,118 +223,100 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
 
         // TODO: recover memtables from WALs..
 
-        let data = Arc::new(RwLock::new(LSMData {
-            memtable: M::new(next_sst_id),
-            imm_memtables: HashMap::new(),
-            l0_tables,
-            sstables,
-        }));
+        let memtable = Arc::new(RwLock::new(M::new(next_sst_id)));
+        let imm_memtables = Arc::new(RwLock::new(HashMap::new()));
+        let l0_tables = Arc::new(RwLock::new(l0_tables));
+        let sstables = Arc::new(RwLock::new(sstables));
         let manifest = Arc::new(Mutex::new(manifest));
-        let (active_flush_tasks, flush_notifier, flush_complete_notifier, handle, sender) =
-            Self::spawn_flush_worker(data.clone(), &options, manifest.clone(), path.to_path_buf());
+
+        let flush_worker = FlushSystem {
+            imm_memtables: imm_memtables.clone(),
+            l0_tables: l0_tables.clone(),
+            sstables: sstables.clone(),
+            manifest: manifest.clone(),
+            path: path.to_path_buf(),
+            options: options.clone(),
+        };
+        let flush_handle = flush_worker.init();
 
         Ok(Self {
-            data,
+            swap_lock: Mutex::new(()),
+            memtable,
+            imm_memtables,
+            l0_tables,
+            sstables,
             path: path.to_path_buf(),
             next_sst_id: AtomicUsize::new(next_sst_id),
             options: Arc::new(options),
             manifest,
-            active_flush_tasks,
-            flush_sender: sender,
-            flush_handle: handle,
-            flush_notifier,
-            flush_complete_notify: flush_complete_notifier,
+            flush_handle,
         })
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn spawn_flush_worker(
-        data: Arc<RwLock<LSMData<M>>>,
-        options: &LSMStorageOptions,
-        manifest: Arc<Mutex<Manifest>>,
-        path: PathBuf,
-    ) -> (
-        Arc<AtomicUsize>,
-        Arc<Notify>,
-        Arc<Notify>,
-        JoinHandle<()>,
-        tokio::sync::mpsc::Sender<M>,
-    ) {
-        let (tx, rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
-        let path = Arc::new(path);
-        let active_flush_tasks = Arc::new(AtomicUsize::new(0));
-        let flush_complete_notify = Arc::new(Notify::new());
-        let flush_notifier = Arc::new(Notify::new());
-
-        let handle = tokio::spawn(flush_worker(
-            data,
-            options.block_size,
-            manifest,
-            rx,
-            path,
-            active_flush_tasks.clone(),
-            flush_complete_notify.clone(),
-            flush_notifier.clone(),
-            options.num_flush_jobs,
-        ));
-
-        (
-            active_flush_tasks,
-            flush_notifier,
-            flush_complete_notify,
-            handle,
-            tx,
-        )
     }
 
     /// Waits for all flushes to be done then closes db.
     pub async fn close(self) -> Result<()> {
-        while self.active_flush_tasks.load(Ordering::SeqCst) > 0 {
-            self.flush_complete_notify.notified().await;
-        }
-        self.flush_notifier.notify_one();
-        self.flush_handle.await.unwrap();
-        let mut guard = self.data.write().await;
+        // Destructure self to take ownership of all fields
+        let LSMStorage {
+            path,
+            swap_lock: _,
+            memtable,
+            imm_memtables,
+            l0_tables: _,
+            sstables: _,
+            options,
+            next_sst_id: _,
+            manifest,
+            flush_handle,
+        } = self;
 
-        let id = guard.memtable.get_id();
-        let memtable = std::mem::replace(&mut guard.memtable, M::new(0));
-        guard.imm_memtables.insert(id, memtable);
-
-        for memtable in guard.imm_memtables.values() {
-            if memtable.size_estimate() == 0 {
-                continue;
-            }
+        flush_handle.sender.send(FlushCommand::Shutdown).await?;
+        flush_handle.handle.await?;
+        let memtable = Arc::try_unwrap(memtable).unwrap().into_inner();
+        if memtable.size_estimate() > 0 {
             let id = memtable.get_id();
-            let sst_path = self.path.join(format!("{id}.sst"));
+            flush_memtable(options.block_size, &path, &memtable).await?;
+            manifest
+                .lock()
+                .await
+                .add_record(ManifestRecord::Flush(id))?;
+        }
 
-            let mut builder = SSTableBuilder::new(self.options.block_size);
-            memtable.flush(&mut builder);
-            builder.build(sst_path).unwrap();
+        let imm_memtables = Arc::try_unwrap(imm_memtables).unwrap().into_inner();
+        for memtable in imm_memtables.values() {
+            let id = memtable.get_id();
+            flush_memtable(options.block_size, &path, memtable).await?;
 
-            let manifest = self.manifest.lock().await;
-            manifest.add_record(ManifestRecord::Flush(id))?;
-            drop(manifest);
+            manifest
+                .lock()
+                .await
+                .add_record(ManifestRecord::Flush(id))?;
         }
 
         Ok(())
     }
 
-    pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) {
+    pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) -> Result<()> {
         let key = key.as_ref();
         // TODO: Propper handling of channel overflow.
         if key.is_empty() {
             panic!("Empty keys are not allowed")
         }
-        let mut guard = self.data.write().await;
 
-        guard.memtable.set(Bytes::copy_from_slice(key), value);
+        let mut memtable = self.memtable.write().await;
 
-        if guard.memtable.size_estimate() > self.options.memtables_size {
+        memtable.set(Bytes::copy_from_slice(key), value);
+
+        if memtable.size_estimate() > self.options.memtables_size {
+            drop(memtable);
+
             let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-            let new_memtable = M::new(old_id + 1);
-            let old_memtable = mem::replace(&mut guard.memtable, new_memtable);
-            guard.imm_memtables.insert(old_id, old_memtable.clone());
+            let new_memtable = Arc::new(RwLock::new(M::new(old_id + 1)));
+            let old_memtable = self.swap_memtable(new_memtable).await;
 
+            self.imm_memtables
+                .write()
+                .await
+                .insert(old_id, old_memtable.clone());
             {
                 // TODO: Propper handling of channel overflow.
                 self.manifest
@@ -308,24 +326,20 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
                     .unwrap();
             }
 
-            // TODO: Propper handling of channel overflow.
-            loop {
-                let res = self.flush_sender.try_send(old_memtable.clone());
-                match res {
-                    Ok(()) => break,
-                    Err(_) => {
-                        sleep(Duration::from_secs(2));
-                    }
-                }
-            }
+            // TODO: Error handling.
+            self.flush_handle
+                .sender
+                .send(FlushCommand::Memtable(old_memtable))
+                .await?;
         }
+        Ok(())
     }
 
     pub async fn get(&self, key: &impl AsRef<[u8]>) -> Option<Bytes> {
-        let guard = self.data.read().await;
+        let memtable = self.memtable.read().await;
         let key = key.as_ref();
 
-        let mut candidate = guard.memtable.get(key);
+        let mut candidate = memtable.get(key);
         if candidate.is_some() {
             if candidate == Some(TOMBSTONE) {
                 return None;
@@ -334,7 +348,8 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
             }
         }
 
-        for memtable in guard.imm_memtables.values() {
+        let imm_memtables = self.imm_memtables.read().await;
+        for memtable in imm_memtables.values() {
             match memtable.get(key) {
                 None => continue,
                 Some(val) => candidate = Some(val),
@@ -348,20 +363,24 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
             return candidate;
         }
 
-        for sst_id in &guard.l0_tables {
+        drop(imm_memtables);
+
+        let l0_tables = self.l0_tables.read().await;
+        let sstables = self.sstables.read().await;
+        l0_tables.iter().for_each(|sst_id| {
             // TODO: Propper error handling
-            let sst = guard.sstables.get(sst_id).unwrap();
+            let sst = sstables.get(sst_id).unwrap();
             let try_get_value = sst.get(key);
             // TODO: Propper error handling
-            match try_get_value {
-                Ok(maybe_value) => {
-                    if maybe_value.is_some() {
-                        candidate = maybe_value;
-                    }
+            if let Ok(maybe_value) = try_get_value {
+                if maybe_value.is_some() {
+                    candidate = maybe_value;
                 }
-                Err(_) => continue,
             }
-        }
+        });
+
+        drop(sstables);
+        drop(l0_tables);
 
         if candidate.is_some() {
             if candidate == Some(TOMBSTONE) {
@@ -373,8 +392,14 @@ impl<M: Memtable + Clone + Send + Sync> LSMStorage<M> {
         None
     }
 
-    pub async fn delete(&mut self, key: &impl AsRef<[u8]>) {
-        self.insert(key, TOMBSTONE).await;
+    pub async fn delete(&mut self, key: &impl AsRef<[u8]>) -> Result<()> {
+        self.insert(key, TOMBSTONE).await
+    }
+
+    async fn swap_memtable(&mut self, new_memtable: Arc<RwLock<M>>) -> M {
+        let _lock = self.swap_lock.lock().await;
+        let old_memtable = mem::replace(&mut self.memtable, new_memtable);
+        Arc::try_unwrap(old_memtable).unwrap().into_inner()
     }
 }
 
@@ -393,10 +418,10 @@ mod lsm_storage_tests {
         let dir = tempdir()?;
         let mut storage = Storage::open(&dir, LSMStorageOptions::default())?;
 
-        storage.insert(b"key1", Bytes::from("val1")).await;
+        storage.insert(b"key1", Bytes::from("val1")).await?;
         assert_eq!(storage.get(&b"key1").await, Some(Bytes::from("val1")));
 
-        storage.delete(&b"key1").await;
+        storage.delete(&b"key1").await?;
         assert_eq!(storage.get(&b"key1").await, None);
         Ok(())
     }
@@ -406,7 +431,7 @@ mod lsm_storage_tests {
         let dir = tempdir()?;
         {
             let mut storage = Storage::open(&dir, LSMStorageOptions::default())?;
-            storage.insert(b"persisted", Bytes::from("data")).await;
+            storage.insert(b"persisted", Bytes::from("data")).await?;
             storage.close().await?;
         }
 
@@ -426,7 +451,7 @@ mod lsm_storage_tests {
             },
         )?;
 
-        storage.insert(b"flushed", Bytes::from("value")).await;
+        storage.insert(b"flushed", Bytes::from("value")).await?;
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait for flush
         storage.close().await.unwrap();
 

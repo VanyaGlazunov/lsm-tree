@@ -36,11 +36,11 @@ proptest! {
             for (key, value) in &operations {
                 match value {
                     Some(v) => {
-                        storage.insert(key, Bytes::copy_from_slice(v)).await;
+                        storage.insert(key, Bytes::copy_from_slice(v)).await.unwrap();
                         reference.insert(key.clone(), v.clone());
                     }
                     None => {
-                        storage.delete(key).await;
+                        storage.delete(key).await.unwrap();
                         reference.remove(key);
                     }
                 }
@@ -85,7 +85,8 @@ async fn test_concurrent_access() -> Result<()> {
                     .lock()
                     .await
                     .insert(&key, Bytes::from("value"))
-                    .await;
+                    .await
+                    .unwrap();
                 assert_eq!(
                     storage.lock().await.get(&key).await,
                     Some(Bytes::from("value"))
@@ -115,18 +116,18 @@ async fn test_edge_cases() -> Result<()> {
 
     // Large values
     let big_val = vec![0u8; 1 << 20]; // 1MB
-    storage.insert(b"big", Bytes::from(big_val.clone())).await;
+    storage.insert(b"big", Bytes::from(big_val.clone())).await?;
     assert_eq!(storage.get(&b"big").await, Some(Bytes::from(big_val)));
 
     // Repeated overwrites
     for i in 0..100 {
-        storage.insert(b"key", Bytes::from(i.to_string())).await;
+        storage.insert(b"key", Bytes::from(i.to_string())).await?;
     }
     assert_eq!(storage.get(&b"key").await, Some(Bytes::from("99")));
 
     // Tombstone persistence
-    storage.insert(b"temp", Bytes::from("data")).await;
-    storage.delete(&b"temp").await;
+    storage.insert(b"temp", Bytes::from("data")).await?;
+    storage.delete(&b"temp").await?;
     storage.close().await?;
     let storage = Storage::open(&dir, LSMStorageOptions::default())?;
     assert_eq!(storage.get(&b"temp").await, None);
@@ -149,7 +150,7 @@ async fn test_flush_race_conditions() -> Result<()> {
     for i in 0..100 {
         storage
             .insert(format!("key-{}", i).as_bytes(), Bytes::from("value"))
-            .await;
+            .await?;
     }
 
     // Verify all data while flushes are happening
