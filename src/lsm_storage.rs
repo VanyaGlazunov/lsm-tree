@@ -32,7 +32,15 @@ const DEFAULT_MEMTABLE_CAP: usize = 2;
 const DEFAULT_NUM_FLUSH_WORKERS: usize = 2;
 
 #[derive(Clone)]
+/// Represents options to configure LSMStorage:
+///
+/// 1) Size of block in SSTable.
+///
+/// 2) Size of memtable.
+///
+/// 3) Number of flush tasks that runs concurrently.
 pub struct LSMStorageOptions {
+    /// Size of a block in SSTable.
     pub block_size: usize,
     pub memtables_size: usize,
     // Number of immutable memtables stored in memory.
@@ -41,16 +49,27 @@ pub struct LSMStorageOptions {
     pub num_flush_jobs: usize,
 }
 
+/// Represents key-value storage based on the log-structured merge tree.
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
+    /// Path in which all files of the storage will be created.
     path: PathBuf,
+    /// Lock for swapping memtables.
     swap_lock: Mutex<()>,
+    /// Current memtable.
     memtable: Arc<RwLock<M>>,
+    /// All frozen immutable memtables that are not yet flushed indexed by their id.
     imm_memtables: Arc<RwLock<HashMap<usize, M>>>,
+    /// SSTables of the l0 level.
     l0_tables: Arc<RwLock<Vec<usize>>>,
+    /// All SSTables indexed by their id.
     sstables: Arc<RwLock<HashMap<usize, SSTable>>>,
+    /// Options of the storage.
     options: Arc<LSMStorageOptions>,
+    /// Id of the next SSTable; Increasing monotonically when new memtable is created.
     next_sst_id: AtomicUsize,
+    /// Storage manifest.
     manifest: Arc<Mutex<Manifest>>,
+    /// Handle of the flush system; Used for shutting down flush_system and wait for every flush completion.
     flush_handle: FlushHandle<M>,
 }
 
@@ -175,6 +194,7 @@ async fn flush_memtable(
 }
 
 impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
+    /// Opens db from path if there is a manifest file, creates new db in the given path otherwise.
     pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let mut l0_tables = Vec::<usize>::new();
@@ -229,7 +249,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let sstables = Arc::new(RwLock::new(sstables));
         let manifest = Arc::new(Mutex::new(manifest));
 
-        let flush_worker = FlushSystem {
+        let flush_system = FlushSystem {
             imm_memtables: imm_memtables.clone(),
             l0_tables: l0_tables.clone(),
             sstables: sstables.clone(),
@@ -237,7 +257,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             path: path.to_path_buf(),
             options: options.clone(),
         };
-        let flush_handle = flush_worker.init();
+        let flush_handle = flush_system.init();
 
         Ok(Self {
             swap_lock: Mutex::new(()),
@@ -271,6 +291,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
 
         flush_handle.sender.send(FlushCommand::Shutdown).await?;
         flush_handle.handle.await?;
+
         let memtable = Arc::try_unwrap(memtable).unwrap().into_inner();
         if memtable.size_estimate() > 0 {
             let id = memtable.get_id();
@@ -295,6 +316,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         Ok(())
     }
 
+    /// Inserts given key-value pair into the db.
     pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) -> Result<()> {
         let key = key.as_ref();
         // TODO: Propper handling of channel overflow.
@@ -335,6 +357,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         Ok(())
     }
 
+    /// Returns Some(value) if the corresponding value is found for the given key, None otherwise.
     pub async fn get(&self, key: &impl AsRef<[u8]>) -> Option<Bytes> {
         let memtable = self.memtable.read().await;
         let key = key.as_ref();
@@ -392,6 +415,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         None
     }
 
+    /// Deletes value corresponding for the given key if it is present in the db.
     pub async fn delete(&mut self, key: &impl AsRef<[u8]>) -> Result<()> {
         self.insert(key, TOMBSTONE).await
     }
