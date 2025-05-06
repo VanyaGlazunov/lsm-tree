@@ -3,7 +3,7 @@ use std::{fs::OpenOptions, io::Write, path::Path};
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes};
 
-use crate::block::builder::BlockBuilder;
+use crate::{block::builder::BlockBuilder, lsm_storage::Record};
 
 use super::{BlockMeta, SSTable};
 
@@ -28,7 +28,7 @@ impl SSTableBuilder {
         }
     }
 
-    pub fn add(&mut self, key: Bytes, value: Bytes) {
+    pub fn add(&mut self, key: Bytes, value: Record) {
         if self.current_first_key.is_empty() {
             self.current_first_key = key.clone();
         }

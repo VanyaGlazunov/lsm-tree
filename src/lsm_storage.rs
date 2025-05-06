@@ -24,28 +24,50 @@ use crate::{
 };
 
 // TODO: Fix tombstone logic. i.e user shouldn't be able to replicate tombstone.
-const TOMBSTONE: Bytes = Bytes::from_static(b"__TOMBSTONE__");
+const TOMBSTONE: Record = Record::Delete;
 const FLUSH_CHANNEL_SIZE: usize = 100;
 const DEFAULT_BLOCK_SIZE: usize = 1 << 12;
 const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
 const DEFAULT_MEMTABLE_CAP: usize = 2;
 const DEFAULT_NUM_FLUSH_WORKERS: usize = 2;
 
+#[derive(Clone, PartialEq, Debug)]
+pub enum Record {
+    Put(Bytes),
+    Delete,
+}
+
+impl Record {
+    pub fn value_len(&self) -> usize {
+        match self {
+            Record::Put(val) => val.len(),
+            Record::Delete => 0,
+        }
+    }
+
+    pub fn put_from_slice(data: impl AsRef<[u8]>) -> Self {
+        Record::Put(Bytes::copy_from_slice(data.as_ref()))
+    }
+
+    pub fn into_inner(self) -> Option<Bytes> {
+        match self {
+            Record::Delete => None,
+            Record::Put(val) => Some(val),
+        }
+    }
+}
+
 #[derive(Clone)]
 /// Represents options to configure LSMStorage:
-///
-/// 1) Size of block in SSTable.
-///
-/// 2) Size of memtable.
-///
-/// 3) Number of flush tasks that runs concurrently.
 pub struct LSMStorageOptions {
     /// Size of a block in SSTable.
     pub block_size: usize,
+    /// Size of memtables
     pub memtables_size: usize,
     // Number of immutable memtables stored in memory.
     #[allow(unused)]
     pub memtables_cap: usize,
+    /// Number of async flush tasks
     pub num_flush_jobs: usize,
 }
 
@@ -276,6 +298,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     /// Waits for all flushes to be done then closes db.
     pub async fn close(self) -> Result<()> {
         // Destructure self to take ownership of all fields
+        // Needed to solve partially moved problems
         let LSMStorage {
             path,
             swap_lock: _,
@@ -318,43 +341,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
 
     /// Inserts given key-value pair into the db.
     pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) -> Result<()> {
-        let key = key.as_ref();
-        // TODO: Propper handling of channel overflow.
-        if key.is_empty() {
-            panic!("Empty keys are not allowed")
-        }
-
-        let mut memtable = self.memtable.write().await;
-
-        memtable.set(Bytes::copy_from_slice(key), value);
-
-        if memtable.size_estimate() > self.options.memtables_size {
-            drop(memtable);
-
-            let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-            let new_memtable = Arc::new(RwLock::new(M::new(old_id + 1)));
-            let old_memtable = self.swap_memtable(new_memtable).await;
-
-            self.imm_memtables
-                .write()
-                .await
-                .insert(old_id, old_memtable.clone());
-            {
-                // TODO: Propper handling of channel overflow.
-                self.manifest
-                    .lock()
-                    .await
-                    .add_record(ManifestRecord::NewMemtable(old_id))
-                    .unwrap();
-            }
-
-            // TODO: Error handling.
-            self.flush_handle
-                .sender
-                .send(FlushCommand::Memtable(old_memtable))
-                .await?;
-        }
-        Ok(())
+        self.insert_inner(key, Record::Put(value)).await
     }
 
     /// Returns Some(value) if the corresponding value is found for the given key, None otherwise.
@@ -363,12 +350,8 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let key = key.as_ref();
 
         let mut candidate = memtable.get(key);
-        if candidate.is_some() {
-            if candidate == Some(TOMBSTONE) {
-                return None;
-            } else {
-                return candidate;
-            }
+        if let Some(rec) = candidate {
+            return rec.into_inner();
         }
 
         let imm_memtables = self.imm_memtables.read().await;
@@ -379,11 +362,8 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             }
         }
 
-        if candidate.is_some() {
-            if candidate == Some(TOMBSTONE) {
-                return None;
-            }
-            return candidate;
+        if let Some(rec) = candidate {
+            return rec.into_inner();
         }
 
         drop(imm_memtables);
@@ -405,19 +385,53 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         drop(sstables);
         drop(l0_tables);
 
-        if candidate.is_some() {
-            if candidate == Some(TOMBSTONE) {
-                return None;
-            }
-            return candidate;
+        if let Some(rec) = candidate {
+            return rec.into_inner();
         }
 
         None
     }
 
-    /// Deletes value corresponding for the given key if it is present in the db.
+    /// Deletes value corresponding to the given key if it is present in the db.
     pub async fn delete(&mut self, key: &impl AsRef<[u8]>) -> Result<()> {
-        self.insert(key, TOMBSTONE).await
+        self.insert_inner(key, TOMBSTONE).await
+    }
+
+    async fn insert_inner(&mut self, key: impl AsRef<[u8]>, value: Record) -> Result<()> {
+        let key = key.as_ref();
+        if key.is_empty() {
+            anyhow::bail!("Empty keys are not allowed");
+        }
+
+        let mut memtable = self.memtable.write().await;
+        memtable.set(Bytes::copy_from_slice(key), value);
+
+        if memtable.size_estimate() > self.options.memtables_size {
+            drop(memtable);
+
+            let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+            let new_memtable = Arc::new(RwLock::new(M::new(old_id + 1)));
+            let old_memtable = self.swap_memtable(new_memtable).await;
+
+            self.imm_memtables
+                .write()
+                .await
+                .insert(old_id, old_memtable.clone());
+            {
+                self.manifest
+                    .lock()
+                    .await
+                    .add_record(ManifestRecord::NewMemtable(old_id))
+                    .context("Failed to add NewMemtable record to manifest")?
+            }
+
+            self.flush_handle
+                .sender
+                .send(FlushCommand::Memtable(old_memtable))
+                .await
+                .context("Failed to send memtable into flush channel")?;
+        }
+        Ok(())
     }
 
     async fn swap_memtable(&mut self, new_memtable: Arc<RwLock<M>>) -> M {

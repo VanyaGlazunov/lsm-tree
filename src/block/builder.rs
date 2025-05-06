@@ -1,3 +1,5 @@
+use crate::lsm_storage::Record;
+
 use super::{Block, BufMut, Bytes, SIZEOF_U16};
 
 #[derive(Debug)]
@@ -26,26 +28,31 @@ impl BlockBuilder {
         self.offsets.is_empty()
     }
 
-    /// Appends (key, value) to the block.
+    /// Tries to appends key-record pair to the block.
     /// Returns true if estimated block size is valid after addition a new element, false otherwise.
-    pub fn add(&mut self, key: Bytes, value: Bytes) -> bool {
+    pub fn add(&mut self, key: Bytes, value: Record) -> bool {
         // Check if (key, value) fits in current block or if it is the first element in the block.
-        if self.size() + key.len() + value.len() + SIZEOF_U16 * 3 > self.block_size
-            && !self.is_empty()
-        {
+        let add_size = key.len() + value.value_len() + SIZEOF_U16 * 3;
+        if self.size() + add_size > self.block_size && !self.is_empty() {
             return false;
         }
 
-        // Firstly put offset
+        // offset
         self.offsets.push(self.data.len() as u16);
-        // Then key len
+        // key len
         self.data.put_u16(key.len() as u16);
-        // Then key itself
+        // key
         self.data.put(key);
-        // Then value len
-        self.data.put_u16(value.len() as u16);
-        // Then value
-        self.data.put(value);
+        match value {
+            Record::Delete => self.data.put_u8(1),
+            Record::Put(val) => {
+                self.data.put_u8(0);
+                // value len
+                self.data.put_u16(val.len() as u16);
+                // value
+                self.data.put(val);
+            }
+        }
 
         true
     }

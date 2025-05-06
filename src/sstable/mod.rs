@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use crate::block::Block;
+use crate::{block::Block, lsm_storage::Record};
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes};
 
@@ -106,7 +106,7 @@ impl SSTable {
     }
 
     /// Returns result containing value associated with the given key if it is present in the table, None otherwise.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Record>> {
         // Index of the first block with first_key >= key.
         let partition_point = self.meta.partition_point(|block| block.first_key <= key);
 
@@ -149,8 +149,16 @@ impl SSTable {
     }
 }
 
+impl FromIterator<(Bytes, Record)> for SSTable {
+    fn from_iter<T: IntoIterator<Item = (Bytes, Record)>>(_iter: T) -> Self {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::lsm_storage::Record;
+
     use super::{builder::SSTableBuilder, Bytes, Result, SSTable};
     use tempfile::NamedTempFile;
 
@@ -161,12 +169,15 @@ mod tests {
 
         {
             let mut builder = SSTableBuilder::new(1024);
-            builder.add(Bytes::from("key1"), Bytes::from("value1"));
+            builder.add(Bytes::from("key1"), Record::put_from_slice("value1"));
             builder.build(path)?;
         }
 
         let sstable = SSTable::open(path)?;
-        assert_eq!(sstable.get(b"key1")?, Some(Bytes::from("value1")));
+        assert_eq!(
+            sstable.get(b"key1")?,
+            Some(Record::put_from_slice("value1"))
+        );
         assert_eq!(sstable.first_key(), Bytes::from("key1"));
         assert_eq!(sstable.last_key(), Bytes::from("key1"));
         Ok(())
@@ -181,7 +192,10 @@ mod tests {
             let mut builder = SSTableBuilder::new(30);
             let keys = vec!["a", "b", "c", "d", "e", "f"];
             for key in &keys {
-                builder.add(Bytes::from(*key), Bytes::from(format!("value{}", key)));
+                builder.add(
+                    Bytes::from(*key),
+                    Record::put_from_slice(format!("value{}", key)),
+                );
             }
             builder.build(path)?;
         }
@@ -194,7 +208,7 @@ mod tests {
         for key in ["a", "b", "c", "d", "e", "f"] {
             assert_eq!(
                 sstable.get(key.as_bytes())?,
-                Some(Bytes::from(format!("value{}", key)))
+                Some(Record::put_from_slice(format!("value{}", key)))
             );
         }
         Ok(())
@@ -207,7 +221,7 @@ mod tests {
 
         {
             let mut builder = SSTableBuilder::new(1024);
-            builder.add(Bytes::from("b"), Bytes::from("value"));
+            builder.add(Bytes::from("b"), Record::put_from_slice("value"));
             builder.build(path)?;
         }
 
@@ -225,9 +239,9 @@ mod tests {
 
         {
             let mut builder = SSTableBuilder::new(30);
-            builder.add(Bytes::from("b"), Bytes::from("value1"));
-            builder.add(Bytes::from("d"), Bytes::from("value2"));
-            builder.add(Bytes::from("f"), Bytes::from("value3"));
+            builder.add(Bytes::from("b"), Record::put_from_slice("value1"));
+            builder.add(Bytes::from("d"), Record::put_from_slice("value2"));
+            builder.add(Bytes::from("f"), Record::put_from_slice("value3"));
             builder.build(path)?;
         }
 
@@ -235,7 +249,7 @@ mod tests {
 
         assert_eq!(sstable.get(b"c")?, None);
         assert_eq!(sstable.get(b"e")?, None);
-        assert_eq!(sstable.get(b"f")?, Some(Bytes::from("value3")));
+        assert_eq!(sstable.get(b"f")?, Some(Record::put_from_slice("value3")));
         Ok(())
     }
 
@@ -268,12 +282,15 @@ mod tests {
 
         {
             let mut builder = SSTableBuilder::new(1024);
-            builder.add(Bytes::from("persist"), Bytes::from("data"));
+            builder.add(Bytes::from("persist"), Record::put_from_slice("data"));
             builder.build(path)?;
         }
 
         let sstable = SSTable::open(path)?;
-        assert_eq!(sstable.get(b"persist")?, Some(Bytes::from("data")));
+        assert_eq!(
+            sstable.get(b"persist")?,
+            Some(Record::put_from_slice("data"))
+        );
         Ok(())
     }
 }
