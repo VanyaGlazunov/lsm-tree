@@ -72,17 +72,18 @@ pub struct LSMStorageOptions {
 }
 
 /// Main storage engine.
+#[derive(Clone)]
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     path: PathBuf,                                  // Storage directory
-    swap_lock: Mutex<()>,                           // Memtable swap synchronization
+    swap_lock: Arc<Mutex<()>>,                           // Memtable swap synchronization
     memtable: Arc<RwLock<M>>,                       // Active mutable memtable
     imm_memtables: Arc<RwLock<HashMap<usize, M>>>,  // Frozen memtables by IDs
     l0_tables: Arc<RwLock<Vec<usize>>>,             // SSTable IDs in L0
     sstables: Arc<RwLock<HashMap<usize, SSTable>>>, // All SSTables by IDs
     options: Arc<LSMStorageOptions>,                // Configuration
-    next_sst_id: AtomicUsize,                       // SSTable ID counter
+    next_sst_id: Arc<AtomicUsize>,                       // SSTable ID counter
     manifest: Arc<Mutex<Manifest>>,                 // Recovery log
-    flush_handle: FlushHandle<M>,                   // Background flush system handle
+    flush_handle: Arc<FlushHandle<M>>,                   // Background flush system handle
 }
 
 impl Default for LSMStorageOptions {
@@ -163,16 +164,16 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let flush_handle = flush_system.init();
 
         Ok(Self {
-            swap_lock: Mutex::new(()),
+            swap_lock: Arc::new(Mutex::new(())),
             memtable,
             imm_memtables,
             l0_tables,
             sstables,
             path: path.to_path_buf(),
-            next_sst_id: AtomicUsize::new(next_sst_id),
+            next_sst_id: Arc::new(AtomicUsize::new(next_sst_id)),
             options: Arc::new(options),
             manifest,
-            flush_handle,
+            flush_handle: Arc::new(flush_handle),
         })
     }
 
@@ -193,6 +194,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             flush_handle,
         } = self;
 
+        let flush_handle = Arc::try_unwrap(flush_handle).unwrap();
         flush_handle.sender.send(FlushCommand::Shutdown).await?;
         flush_handle.handle.await?;
 

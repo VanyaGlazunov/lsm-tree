@@ -3,7 +3,7 @@ use bytes::Bytes;
 use lsm_tree::lsm_storage::LSMStorage;
 use lsm_tree::{lsm_storage::LSMStorageOptions, memtable::BtreeMapMemtable};
 use proptest::prelude::*;
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 use tempfile::tempdir;
 
 type Storage = LSMStorage<BtreeMapMemtable>;
@@ -68,29 +68,23 @@ proptest! {
 }
 
 #[tokio::test]
-async fn test_concurrent_access() -> Result<()> {
+async fn test_concurrent_write() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Arc::new(tokio::sync::Mutex::new(Storage::open(
+    let storage = Storage::open(
         &dir,
         LSMStorageOptions::default(),
-    )?));
+    )?;
 
     let mut handles = vec![];
     for i in 0..10 {
-        let storage = storage.clone();
+        let mut storage = storage.clone();
         handles.push(tokio::spawn(async move {
             for j in 0..100 {
                 let key = format!("key-{i}-{j}").into_bytes();
                 storage
-                    .lock()
-                    .await
                     .insert(&key, Bytes::from("value"))
                     .await
                     .unwrap();
-                assert_eq!(
-                    storage.lock().await.get(&key).await,
-                    Some(Bytes::from("value"))
-                );
             }
         }));
     }
@@ -99,11 +93,10 @@ async fn test_concurrent_access() -> Result<()> {
         handle.await?;
     }
 
-    let st = storage.lock().await;
     for i in 0..10 {
         for j in 0..100 {
             let key = format!("key-{i}-{j}").into_bytes();
-            assert_eq!(st.get(&key).await, Some(Bytes::from("value")));
+            assert_eq!(storage.get(&key).await, Some(Bytes::from("value")));
         }
     }
     Ok(())

@@ -23,6 +23,7 @@ pub(crate) struct FlushSystem<M: Memtable + Send + Sync> {
     pub options: LSMStorageOptions,
 }
 
+#[derive(Debug)]
 pub struct FlushHandle<M: Memtable + Send + Sync + 'static> {
     pub handle: JoinHandle<()>,
     pub sender: tokio::sync::mpsc::Sender<FlushCommand<M>>,
