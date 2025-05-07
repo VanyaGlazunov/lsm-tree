@@ -13,19 +13,20 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{mpsc::Receiver, Mutex, RwLock, Semaphore},
-    task::JoinHandle,
+    sync::{Mutex, RwLock},
 };
 
 use crate::{
+    flush_system::{FlushCommand, FlushHandle, FlushSystem},
+    lsm_utils::{flush_memtable, get_sst_path},
     manifest::{Manifest, ManifestRecord},
     memtable::Memtable,
-    sstable::{builder::SSTableBuilder, SSTable},
+    sstable::SSTable,
 };
 
 // TODO: Fix tombstone logic. i.e user shouldn't be able to replicate tombstone.
 const TOMBSTONE: Record = Record::Delete;
-const FLUSH_CHANNEL_SIZE: usize = 100;
+pub const FLUSH_CHANNEL_SIZE: usize = 100;
 const DEFAULT_BLOCK_SIZE: usize = 1 << 12;
 const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
 const DEFAULT_MEMTABLE_CAP: usize = 2;
@@ -104,115 +105,6 @@ impl Default for LSMStorageOptions {
             num_flush_jobs: DEFAULT_NUM_FLUSH_WORKERS,
         }
     }
-}
-
-struct FlushSystem<M: Memtable + Send + Sync> {
-    imm_memtables: Arc<RwLock<HashMap<usize, M>>>,
-    l0_tables: Arc<RwLock<Vec<usize>>>,
-    sstables: Arc<RwLock<HashMap<usize, SSTable>>>,
-    manifest: Arc<Mutex<Manifest>>,
-    path: PathBuf,
-    options: LSMStorageOptions,
-}
-
-struct FlushHandle<M: Memtable + Send + Sync + 'static> {
-    handle: JoinHandle<()>,
-    sender: tokio::sync::mpsc::Sender<FlushCommand<M>>,
-}
-
-enum FlushCommand<M: Memtable + Send + Sync + 'static> {
-    Memtable(M),
-    Shutdown,
-}
-
-impl<M: Memtable + Send + Sync> FlushSystem<M> {
-    /// Spawns task with reciever for immutable memtables.
-    /// For each recieved memtable spawns task (number of tasks always <= flush_num_jobs) that
-    /// flushes it, writes metainfo into manifest, removes immutable memtable from LSMStorage, adds sstable to LSMStorage.
-    fn init(self) -> FlushHandle<M> {
-        let (tx, rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
-        let path = Arc::new(self.path);
-
-        let handle = tokio::spawn({
-            async move {
-                let semaphore = Arc::new(Semaphore::new(self.options.num_flush_jobs));
-                let mut receiver: Receiver<FlushCommand<M>> = rx;
-
-                while let Some(cmd) = receiver.recv().await {
-                    match cmd {
-                        FlushCommand::Memtable(memtable) => {
-                            let permit = match semaphore.clone().acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => break, // Semaphore closed
-                            };
-
-                            let imm_memtables = self.imm_memtables.clone();
-                            let l0_sstables = self.l0_tables.clone();
-                            let sstables = self.sstables.clone();
-                            let manifest = self.manifest.clone();
-                            let path = Arc::clone(&path);
-
-                            tokio::spawn(async move {
-                                let id = memtable.get_id();
-
-                                // TODO: Error handling
-                                let sst = flush_memtable(
-                                    self.options.block_size,
-                                    path.as_path(),
-                                    &memtable,
-                                )
-                                .await
-                                .unwrap();
-
-                                manifest
-                                    .lock()
-                                    .await
-                                    .add_record(ManifestRecord::Flush(id))
-                                    .unwrap();
-
-                                {
-                                    l0_sstables.write().await.push(id);
-                                    sstables.write().await.insert(id, sst);
-                                    imm_memtables.write().await.remove(&id);
-                                }
-
-                                drop(permit);
-                            });
-                        }
-                        FlushCommand::Shutdown => break,
-                    }
-                }
-
-                // Wait for remaining permits
-                let _ = semaphore
-                    .acquire_many(self.options.num_flush_jobs as u32)
-                    .await;
-            }
-        });
-
-        FlushHandle { handle, sender: tx }
-    }
-}
-
-fn get_sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
-    path.as_ref().to_path_buf().join(format!("{id}.sst"))
-}
-
-/// Creates sstable from memtable via build method in SSTableBuilder.
-async fn flush_memtable(
-    block_size: usize,
-    path: impl AsRef<Path>,
-    memtable: &impl Memtable,
-) -> Result<SSTable> {
-    let mut builder = SSTableBuilder::new(block_size);
-    for (key, value) in memtable.iter() {
-        builder.add(key, value);
-    }
-
-    let id = memtable.get_id();
-    builder
-        .build(get_sst_path(path, id))
-        .context(format!("Failed to flush memtable. id: {id}"))
 }
 
 impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
