@@ -75,15 +75,15 @@ pub struct LSMStorageOptions {
 #[derive(Clone)]
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     path: PathBuf,                                  // Storage directory
-    swap_lock: Arc<Mutex<()>>,                           // Memtable swap synchronization
+    swap_lock: Arc<Mutex<()>>,                      // Memtable swap synchronization
     memtable: Arc<RwLock<M>>,                       // Active mutable memtable
     imm_memtables: Arc<RwLock<HashMap<usize, M>>>,  // Frozen memtables by IDs
     l0_tables: Arc<RwLock<Vec<usize>>>,             // SSTable IDs in L0
     sstables: Arc<RwLock<HashMap<usize, SSTable>>>, // All SSTables by IDs
     options: Arc<LSMStorageOptions>,                // Configuration
-    next_sst_id: Arc<AtomicUsize>,                       // SSTable ID counter
+    next_sst_id: Arc<AtomicUsize>,                  // SSTable ID counter
     manifest: Arc<Mutex<Manifest>>,                 // Recovery log
-    flush_handle: Arc<FlushHandle<M>>,                   // Background flush system handle
+    flush_handle: Arc<FlushHandle<M>>,              // Background flush system handle
 }
 
 impl Default for LSMStorageOptions {

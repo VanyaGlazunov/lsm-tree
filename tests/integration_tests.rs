@@ -70,10 +70,7 @@ proptest! {
 #[tokio::test]
 async fn test_concurrent_write() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Storage::open(
-        &dir,
-        LSMStorageOptions::default(),
-    )?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
 
     let mut handles = vec![];
     for i in 0..10 {
@@ -81,10 +78,7 @@ async fn test_concurrent_write() -> Result<()> {
         handles.push(tokio::spawn(async move {
             for j in 0..100 {
                 let key = format!("key-{i}-{j}").into_bytes();
-                storage
-                    .insert(&key, Bytes::from("value"))
-                    .await
-                    .unwrap();
+                storage.insert(&key, Bytes::from("value")).await.unwrap();
             }
         }));
     }
