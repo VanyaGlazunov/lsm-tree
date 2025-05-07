@@ -7,16 +7,18 @@ use crate::{block::builder::BlockBuilder, lsm_storage::Record};
 
 use super::{BlockMeta, SSTable};
 
+/// Constructs SSTable from key-value stream.
 pub struct SSTableBuilder {
-    block_builder: BlockBuilder,
-    target_block_size: usize,
-    data: Vec<u8>,
-    meta: Vec<BlockMeta>,
-    current_first_key: Bytes,
-    current_last_key: Bytes,
+    block_builder: BlockBuilder, // Current block
+    target_block_size: usize,    // Block size limit
+    data: Vec<u8>,               // Serialized blocks
+    meta: Vec<BlockMeta>,        // Meta data for each block
+    current_first_key: Bytes,    // First key in current block
+    current_last_key: Bytes,     // Last key in current block
 }
 
 impl SSTableBuilder {
+    /// Creates new instance.
     pub fn new(target_block_size: usize) -> Self {
         Self {
             block_builder: BlockBuilder::new(target_block_size),
@@ -28,6 +30,7 @@ impl SSTableBuilder {
         }
     }
 
+    /// Adda entry to future SSTable.
     pub fn add(&mut self, key: Bytes, value: Record) {
         if self.current_first_key.is_empty() {
             self.current_first_key = key.clone();
@@ -44,7 +47,8 @@ impl SSTableBuilder {
         self.current_last_key = key;
     }
 
-    pub fn finish_block(&mut self) {
+    // builds current block and adds it to future SSTable.
+    fn finish_block(&mut self) {
         if self.block_builder.is_empty() {
             return;
         }
@@ -63,6 +67,7 @@ impl SSTableBuilder {
         self.data.extend(block.encode());
     }
 
+    // Serializes all meta data from blocks to one buffer.
     fn serialize_metadata(&self) -> Vec<u8> {
         let mut buf = Vec::<u8>::new();
         buf.put_u32(self.meta.len() as u32);
@@ -78,7 +83,7 @@ impl SSTableBuilder {
         buf
     }
 
-    /// Builds sst from added data and writes it on disk ans syncs; returns built sst.
+    /// Finilizes SSTable and writes on disk all serialized data (also fsyncs).
     pub fn build(mut self, path: impl AsRef<Path>) -> Result<SSTable> {
         self.finish_block();
 

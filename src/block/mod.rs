@@ -6,6 +6,28 @@ use crate::lsm_storage::Record;
 
 const SIZEOF_U16: usize = std::mem::size_of::<u16>();
 
+/// A fixed-size storage unit containing key-value entries and offset metadata.
+///
+/// # Fields
+/// - `data`: Serialized key-value entries (binary format)
+/// - `offsets`: Array of u16 offsets pointing to entry locations in `data`
+/// ## Block Format (On-Disk)
+///
+/// | Component          | Data Type      | Description                                                                 |
+/// |---------------------|----------------|-----------------------------------------------------------------------------|
+/// | **Data**           | `Vec<u8>`      | Serialized entries in binary format. Each entry contains:                   |
+/// |                    |                | - **Key Length** (2 bytes): `u16` length of key                             |
+/// |                    |                | - **Key**: Raw key bytes                                                   |
+/// |                    |                | - **Tombstone** (1 byte): `0` = Put, `1` = Delete                          |
+/// |                    |                | - **Value Length** (2 bytes, optional): Only present for `Put` records     |
+/// |                    |                | - **Value** (optional): Raw value bytes for `Put`                          |
+/// | **Offsets**        | `Vec<u16>`     | Array of 2-byte offsets pointing to the start of each entry in `data`       |
+/// | **Footer**         | `u16`          | 2-byte count of entries (number of offsets)                                 |
+///
+/// **Encoding Process**:
+/// 1. Entries are packed into `data` sequentially.
+/// 2. Offsets are appended after all entries.
+/// 3. Footer (offsets count) is written as the last 2 bytes.
 #[derive(Debug)]
 pub struct Block {
     pub data: Vec<u8>,
@@ -13,6 +35,7 @@ pub struct Block {
 }
 
 impl Block {
+    /// Creates an iterator over the block's entries
     pub fn iter(&self) -> BlockIterator {
         BlockIterator {
             data: &self.data,
@@ -21,6 +44,7 @@ impl Block {
         }
     }
 
+    /// Serializes block into [Bytes]
     pub fn encode(self) -> Bytes {
         let mut buf = self.data;
         let offsets_len = self.offsets.len();
@@ -32,6 +56,10 @@ impl Block {
         buf.into()
     }
 
+    /// Reconstructs block from byte slice
+    ///
+    /// #Panics
+    /// - May panic if the block is corrupted/invalid. To prevent this use [builder::BlockBuilder] to build blocks.
     pub fn decode(buf: &[u8]) -> Self {
         let offsets_len = (&buf[buf.len() - SIZEOF_U16..]).get_u16() as usize;
         let data_end = buf.len() - SIZEOF_U16 - SIZEOF_U16 * offsets_len;
@@ -45,6 +73,7 @@ impl Block {
     }
 }
 
+/// Iterator for scanning entries in a [Block]
 pub struct BlockIterator<'a> {
     data: &'a [u8],
     offsets: &'a [u16],
@@ -52,7 +81,7 @@ pub struct BlockIterator<'a> {
 }
 
 impl BlockIterator<'_> {
-    /// Seeks to the first entry with key >= target
+    /// Binary search to first entry with key >= target.
     pub fn seek(&mut self, target: &[u8]) {
         self.current_idx = self.offsets.partition_point(|&offset| {
             let mut entry = &self.data[offset as usize..];
@@ -66,6 +95,7 @@ impl BlockIterator<'_> {
 impl Iterator for BlockIterator<'_> {
     type Item = (Bytes, Record);
 
+    /// Yields next (key, Record) pair
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_idx >= self.offsets.len() {
             return None;

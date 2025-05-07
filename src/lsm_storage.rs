@@ -24,9 +24,8 @@ use crate::{
     sstable::SSTable,
 };
 
-// TODO: Fix tombstone logic. i.e user shouldn't be able to replicate tombstone.
 const TOMBSTONE: Record = Record::Delete;
-pub const FLUSH_CHANNEL_SIZE: usize = 100;
+pub(crate) const FLUSH_CHANNEL_SIZE: usize = 100;
 const DEFAULT_BLOCK_SIZE: usize = 1 << 12;
 const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
 const DEFAULT_MEMTABLE_CAP: usize = 2;
@@ -59,7 +58,7 @@ impl Record {
 }
 
 #[derive(Clone)]
-/// Represents options to configure LSMStorage:
+/// Configuration for [LSMStorage]
 pub struct LSMStorageOptions {
     /// Size of a block in SSTable.
     pub block_size: usize,
@@ -72,28 +71,18 @@ pub struct LSMStorageOptions {
     pub num_flush_jobs: usize,
 }
 
-/// Represents key-value storage based on the log-structured merge tree.
+/// Main storage engine.
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
-    /// Path in which all files of the storage will be created.
-    path: PathBuf,
-    /// Lock for swapping memtables.
-    swap_lock: Mutex<()>,
-    /// Current memtable.
-    memtable: Arc<RwLock<M>>,
-    /// All frozen immutable memtables that are not yet flushed indexed by their id.
-    imm_memtables: Arc<RwLock<HashMap<usize, M>>>,
-    /// SSTables of the l0 level.
-    l0_tables: Arc<RwLock<Vec<usize>>>,
-    /// All SSTables indexed by their id.
-    sstables: Arc<RwLock<HashMap<usize, SSTable>>>,
-    /// Options of the storage.
-    options: Arc<LSMStorageOptions>,
-    /// Id of the next SSTable; Increasing monotonically when new memtable is created.
-    next_sst_id: AtomicUsize,
-    /// Storage manifest.
-    manifest: Arc<Mutex<Manifest>>,
-    /// Handle of the flush system; Used for shutting down flush_system and wait for every flush completion.
-    flush_handle: FlushHandle<M>,
+    path: PathBuf,                                  // Storage directory
+    swap_lock: Mutex<()>,                           // Memtable swap synchronization
+    memtable: Arc<RwLock<M>>,                       // Active mutable memtable
+    imm_memtables: Arc<RwLock<HashMap<usize, M>>>,  // Frozen memtables by IDs
+    l0_tables: Arc<RwLock<Vec<usize>>>,             // SSTable IDs in L0
+    sstables: Arc<RwLock<HashMap<usize, SSTable>>>, // All SSTables by IDs
+    options: Arc<LSMStorageOptions>,                // Configuration
+    next_sst_id: AtomicUsize,                       // SSTable ID counter
+    manifest: Arc<Mutex<Manifest>>,                 // Recovery log
+    flush_handle: FlushHandle<M>,                   // Background flush system handle
 }
 
 impl Default for LSMStorageOptions {
@@ -108,7 +97,7 @@ impl Default for LSMStorageOptions {
 }
 
 impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
-    /// Opens db from path if there is a manifest file, creates new db in the given path otherwise.
+    /// Opens/Creates storage in path given.
     pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let mut l0_tables = Vec::<usize>::new();
@@ -187,7 +176,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         })
     }
 
-    /// Waits for all flushes to be done then closes db.
+    /// Graceful shutdown (waits until all data will be flushed).
     pub async fn close(self) -> Result<()> {
         // Destructure self to take ownership of all fields
         // Needed to solve partially moved problems
@@ -231,12 +220,15 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         Ok(())
     }
 
-    /// Inserts given key-value pair into the db.
+    /// Inserts key-value pair.
+    ///
+    /// # Errors
+    /// Returns error if key is empty.
     pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) -> Result<()> {
         self.insert_inner(key, Record::Put(value)).await
     }
 
-    /// Returns Some(value) if the corresponding value is found for the given key, None otherwise.
+    /// Retrieves value for key.
     pub async fn get(&self, key: &impl AsRef<[u8]>) -> Option<Bytes> {
         let memtable = self.memtable.read().await;
         let key = key.as_ref();
@@ -284,11 +276,15 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         None
     }
 
-    /// Deletes value corresponding to the given key if it is present in the db.
+    /// Deletes key.
+    ///
+    /// # Errors
+    /// Returns error if key is empty.
     pub async fn delete(&mut self, key: &impl AsRef<[u8]>) -> Result<()> {
         self.insert_inner(key, TOMBSTONE).await
     }
 
+    // helper function for inserts.
     async fn insert_inner(&mut self, key: impl AsRef<[u8]>, value: Record) -> Result<()> {
         let key = key.as_ref();
         if key.is_empty() {

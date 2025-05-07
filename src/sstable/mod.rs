@@ -19,13 +19,41 @@ pub struct BlockMeta {
     last_key: Bytes,
 }
 
+/// On-disk sorted key-value data.
+///
+/// # SSTable Format (On-Disk)
+///
+/// | Component               | Data Type/Format                 | Description                                                                  |
+/// |-------------------------|----------------------------------|------------------------------------------------------------------------------|
+/// | **Data Blocks**         | Serialized `Block` entries       |  Sequence of encoded blocks containing key-value pairs (see Block format).   |
+/// |                         |                                  |  Blocks are written contiguously.                                            |
+/// |                         |                                  |                                                                              |
+/// | **Metadata Section**    | Binary format                    |  Contains metadata for all blocks:                                           |
+/// |                         | - `u32`: Number of blocks        |  - For each block:                                                           |
+/// |                         | - Per block:                     |    - `u32`: Block offset in file                                             |
+/// |                         |   - `u16`: First key length      |    - `u16`: First key length + raw bytes                                     |
+/// |                         |   - `[u8]`: First key            |    - `u16`: Last key length + raw bytes                                      |
+/// |                         |   - `u16`: Last key length       |                                                                              |
+/// |                         |   - `[u8]`: Last key             |                                                                              |
+/// | **Footer**              | 8 bytes                          |  Final file section:                                                         |
+/// |                         | - `u32`: Metadata offset         |  Offset to start of metadata section                                         |
+/// |                         | - `u32`: Metadata length         |  Length of metadata section (bytes)                                          |
+///
+///
+/// ## Encoding Process
+/// 1. **Blocks**  
+///    - Write blocks sequentially to file
+/// 2. **Metadata**  
+///    - Serialize metadata after all blocks:
+/// 3. **Footer**  
+///    - Append metadata offset + length as last 8 bytes
 #[derive(Debug)]
 pub struct SSTable {
-    file: File,
-    meta: Vec<BlockMeta>,
-    meta_block_offset: usize,
-    first_key: Bytes,
-    last_key: Bytes,
+    file: File,               // Underlying file
+    meta: Vec<BlockMeta>,     // Blocks' meta data
+    meta_block_offset: usize, // Offset of meta block in file
+    first_key: Bytes,         // First key in SSTable
+    last_key: Bytes,          // Last key in SSTable
 }
 
 fn deserialize_metadata(mut buf: &[u8]) -> Vec<BlockMeta> {
@@ -49,14 +77,21 @@ fn deserialize_metadata(mut buf: &[u8]) -> Vec<BlockMeta> {
 }
 
 impl SSTable {
+    /// Returns first key in SSTable.
     pub fn first_key(&self) -> Bytes {
         self.first_key.clone()
     }
 
+    /// Returns last key in SSTable.
     pub fn last_key(&self) -> Bytes {
         self.last_key.clone()
     }
 
+    /// Opens existing SSTable
+    ///
+    /// #Errors
+    /// - Returns error if can not open SSTable file
+    /// - Returns error if can not decode SSTable file  
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -105,7 +140,7 @@ impl SSTable {
         })
     }
 
-    /// Returns result containing value associated with the given key if it is present in the table, None otherwise.
+    /// Lookups given key in SSTable
     pub fn get(&self, key: &[u8]) -> Result<Option<Record>> {
         // Index of the first block with first_key >= key.
         let partition_point = self.meta.partition_point(|block| block.first_key <= key);
@@ -131,8 +166,8 @@ impl SSTable {
         }
     }
 
-    /// Reads block from sstable file.
-    pub fn read_block(&self, block_index: usize) -> Result<Block> {
+    /// Reads block from sstable by index.
+    fn read_block(&self, block_index: usize) -> Result<Block> {
         let block_offset = self.meta[block_index].offset;
         let end_offset = self
             .meta

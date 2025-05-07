@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 
-/// Creates sstable from memtable via build method in SSTableBuilder.
+/// Builds SSTable from memtable via SSTableBuilder.
 pub(crate) async fn flush_memtable(
     block_size: usize,
     path: impl AsRef<Path>,

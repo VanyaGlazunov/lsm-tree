@@ -8,17 +8,21 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Append-only log for normal/crash recovery.
 pub(crate) struct Manifest {
+    /// File handle of the log.
     file: Arc<Mutex<File>>,
 }
 
+/// Operations types logged in manifest.
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) enum ManifestRecord {
-    NewMemtable(usize),
-    Flush(usize),
+    NewMemtable(usize), // Creation of memtable with given ID
+    Flush(usize),       // Flush of a memtable with given ID
 }
 
 impl Manifest {
+    /// Creates new instance of manifest in the path given.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             file: Arc::new(Mutex::new(
@@ -32,6 +36,10 @@ impl Manifest {
         })
     }
 
+    /// Recovers state from existing manifest.
+    ///
+    /// # Returns
+    /// (Manifest handle, parsed records)
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         // TODO: Check for corruption
         let mut file = OpenOptions::new()
@@ -60,7 +68,7 @@ impl Manifest {
         Ok((manifest, records))
     }
 
-    /// Adds record and syncs file.
+    /// Adds record and fsyncs
     pub fn add_record(&self, record: ManifestRecord) -> Result<()> {
         let mut file = self.file.lock().unwrap();
         let buf = serde_json::to_vec(&record).context("Failed to serialize record")?;
