@@ -31,7 +31,7 @@ impl BlockBuilder {
     }
 
     /// Tries to appends key-record pair to the block.
-    /// 
+    ///
     /// # Returns
     /// Returns true if estimated block size is valid after addition a new element, false otherwise.
     pub fn add(&mut self, key: Bytes, value: Record) -> bool {
