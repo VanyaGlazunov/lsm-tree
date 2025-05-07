@@ -2,6 +2,7 @@ use crate::lsm_storage::Record;
 
 use super::{Block, BufMut, Bytes, SIZEOF_U16};
 
+/// Constructs [Block]
 #[derive(Debug)]
 pub(crate) struct BlockBuilder {
     offsets: Vec<u16>,
@@ -10,6 +11,7 @@ pub(crate) struct BlockBuilder {
 }
 
 impl BlockBuilder {
+    /// Creates new instance.
     pub fn new(block_size: usize) -> Self {
         Self {
             offsets: Vec::new(),
@@ -29,6 +31,8 @@ impl BlockBuilder {
     }
 
     /// Tries to appends key-record pair to the block.
+    /// 
+    /// # Returns
     /// Returns true if estimated block size is valid after addition a new element, false otherwise.
     pub fn add(&mut self, key: Bytes, value: Record) -> bool {
         // Check if (key, value) fits in current block or if it is the first element in the block.
@@ -57,6 +61,7 @@ impl BlockBuilder {
         true
     }
 
+    /// Finilizes block.
     pub fn build(self) -> Block {
         Block {
             data: self.data,
