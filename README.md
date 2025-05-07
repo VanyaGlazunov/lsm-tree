@@ -5,23 +5,6 @@
 A Rust implementation of a Log-Structured Merge Tree (LSM) storage engine initially designed to replace HashMap in Chunkfs(https://github.com/Piletskii-Oleg/chunkfs)
 
 This LSM Storage implementaion takes inspiration and some features from LSM in a week course (https://github.com/skyzh/mini-lsm)
-## Features
-
-- **In-memory layer**
-  - Memtable trait for flexibility (default implementaion based on BTreeMap)
-  - Automatic flushing to disk
-  - Tombstone support for deletions (needs refactoring)
-
-- **On-disk storage**
-  - Block-based SSTable format
-  - Binary search optimized layout
-  - Metadata tracking (first/last keys, offsets)
-
-- **Concurrency & Recovery**
-  - Async I/O with Tokio runtime
-  - RwLock synchronization
-  - Manifest file for db recovery
-  - Configurable flush workers
 
 ## Architecture Overview
 
@@ -31,7 +14,7 @@ TODO
 
 ### Refactoring
 - [] Propper error handling
-- [] Tombstone logic is week (i.e user can replicate tombstone)
+- [x] Tombstone logic is week (i.e user can replicate tombstone)
 - [] Manual flush
 
 ### Priority features

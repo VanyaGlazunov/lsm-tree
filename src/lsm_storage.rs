@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fs::create_dir_all,
-    mem,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -72,11 +71,10 @@ pub struct LSMStorageOptions {
 }
 
 /// Main storage engine.
-#[derive(Clone)]
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     path: PathBuf,                                  // Storage directory
-    swap_lock: Arc<Mutex<()>>,                      // Memtable swap synchronization
-    memtable: Arc<RwLock<M>>,                       // Active mutable memtable
+    swap_lock: Mutex<()>,                           // Memtable swap synchronization
+    memtable: RwLock<M>,                            // Active mutable memtable
     imm_memtables: Arc<RwLock<HashMap<usize, M>>>,  // Frozen memtables by IDs
     l0_tables: Arc<RwLock<Vec<usize>>>,             // SSTable IDs in L0
     sstables: Arc<RwLock<HashMap<usize, SSTable>>>, // All SSTables by IDs
@@ -147,7 +145,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
 
         // TODO: recover memtables from WALs..
 
-        let memtable = Arc::new(RwLock::new(M::new(next_sst_id)));
+        let memtable = RwLock::new(M::new(next_sst_id));
         let imm_memtables = Arc::new(RwLock::new(HashMap::new()));
         let l0_tables = Arc::new(RwLock::new(l0_tables));
         let sstables = Arc::new(RwLock::new(sstables));
@@ -164,7 +162,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let flush_handle = flush_system.init();
 
         Ok(Self {
-            swap_lock: Arc::new(Mutex::new(())),
+            swap_lock: Mutex::new(()),
             memtable,
             imm_memtables,
             l0_tables,
@@ -198,7 +196,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         flush_handle.sender.send(FlushCommand::Shutdown).await?;
         flush_handle.handle.await?;
 
-        let memtable = Arc::try_unwrap(memtable).unwrap().into_inner();
+        let memtable = memtable.into_inner();
         if memtable.size_estimate() > 0 {
             let id = memtable.get_id();
             flush_memtable(options.block_size, &path, &memtable).await?;
@@ -226,7 +224,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     ///
     /// # Errors
     /// Returns error if key is empty.
-    pub async fn insert(&mut self, key: impl AsRef<[u8]>, value: Bytes) -> Result<()> {
+    pub async fn insert(&self, key: impl AsRef<[u8]>, value: Bytes) -> Result<()> {
         self.insert_inner(key, Record::Put(value)).await
     }
 
@@ -282,12 +280,12 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     ///
     /// # Errors
     /// Returns error if key is empty.
-    pub async fn delete(&mut self, key: &impl AsRef<[u8]>) -> Result<()> {
+    pub async fn delete(&self, key: &impl AsRef<[u8]>) -> Result<()> {
         self.insert_inner(key, TOMBSTONE).await
     }
 
     // helper function for inserts.
-    async fn insert_inner(&mut self, key: impl AsRef<[u8]>, value: Record) -> Result<()> {
+    async fn insert_inner(&self, key: impl AsRef<[u8]>, value: Record) -> Result<()> {
         let key = key.as_ref();
         if key.is_empty() {
             anyhow::bail!("Empty keys are not allowed");
@@ -300,7 +298,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             drop(memtable);
 
             let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-            let new_memtable = Arc::new(RwLock::new(M::new(old_id + 1)));
+            let new_memtable = M::new(old_id + 1);
             let old_memtable = self.swap_memtable(new_memtable).await;
 
             self.imm_memtables
@@ -324,10 +322,12 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         Ok(())
     }
 
-    async fn swap_memtable(&mut self, new_memtable: Arc<RwLock<M>>) -> M {
+    async fn swap_memtable(&self, new_memtable: M) -> M {
         let _lock = self.swap_lock.lock().await;
-        let old_memtable = mem::replace(&mut self.memtable, new_memtable);
-        Arc::try_unwrap(old_memtable).unwrap().into_inner()
+        // let old_memtable = mem::replace(&mut self.memtable, new_memtable);
+        let old_memtable = self.memtable.write().await.clone();
+        *self.memtable.write().await = new_memtable;
+        old_memtable
     }
 }
 
@@ -344,7 +344,7 @@ mod lsm_storage_tests {
     #[tokio::test]
     async fn test_basic_crud() -> Result<()> {
         let dir = tempdir()?;
-        let mut storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
 
         storage.insert(b"key1", Bytes::from("val1")).await?;
         assert_eq!(storage.get(&b"key1").await, Some(Bytes::from("val1")));
@@ -358,7 +358,7 @@ mod lsm_storage_tests {
     async fn test_persistence() -> Result<()> {
         let dir = tempdir()?;
         {
-            let mut storage = Storage::open(&dir, LSMStorageOptions::default())?;
+            let storage = Storage::open(&dir, LSMStorageOptions::default())?;
             storage.insert(b"persisted", Bytes::from("data")).await?;
             storage.close().await?;
         }
@@ -371,7 +371,7 @@ mod lsm_storage_tests {
     #[tokio::test]
     async fn test_flush_recovery() -> Result<()> {
         let dir = tempdir()?;
-        let mut storage = Storage::open(
+        let storage = Storage::open(
             &dir,
             LSMStorageOptions {
                 memtables_size: 1,

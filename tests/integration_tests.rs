@@ -4,6 +4,7 @@ use lsm_tree::lsm_storage::LSMStorage;
 use lsm_tree::{lsm_storage::LSMStorageOptions, memtable::BtreeMapMemtable};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 type Storage = LSMStorage<BtreeMapMemtable>;
@@ -30,7 +31,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let dir = tempdir().unwrap();
-            let mut storage = Storage::open(&dir, LSMStorageOptions::default()).unwrap();
+            let storage = Storage::open(&dir, LSMStorageOptions::default()).unwrap();
             let mut reference = BTreeMap::new();
 
             for (key, value) in &operations {
@@ -70,11 +71,11 @@ proptest! {
 #[tokio::test]
 async fn test_concurrent_write() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Arc::new(Storage::open(&dir, LSMStorageOptions::default())?);
 
     let mut handles = vec![];
     for i in 0..10 {
-        let mut storage = storage.clone();
+        let storage = storage.clone();
         handles.push(tokio::spawn(async move {
             for j in 0..100 {
                 let key = format!("key-{i}-{j}").into_bytes();
@@ -99,7 +100,7 @@ async fn test_concurrent_write() -> Result<()> {
 #[tokio::test]
 async fn test_edge_cases() -> Result<()> {
     let dir = tempdir()?;
-    let mut storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
 
     // Large values
     let big_val = vec![0u8; 1 << 20]; // 1MB
@@ -131,7 +132,7 @@ async fn test_flush_race_conditions() -> Result<()> {
         ..Default::default()
     };
 
-    let mut storage = Storage::open(&dir, options)?;
+    let storage = Storage::open(&dir, options)?;
 
     // Insert enough data to trigger multiple flushes
     for i in 0..100 {
