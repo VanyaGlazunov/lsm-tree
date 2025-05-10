@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use tokio::{
     sync::{mpsc::Receiver, Mutex, RwLock, Semaphore},
@@ -15,9 +15,9 @@ use crate::{
 };
 
 pub(crate) struct FlushSystem<M: Memtable + Send + Sync> {
-    pub imm_memtables: Arc<RwLock<HashMap<usize, M>>>,
+    pub imm_memtables: Arc<RwLock<BTreeMap<usize, M>>>,
     pub l0_tables: Arc<RwLock<Vec<usize>>>,
-    pub sstables: Arc<RwLock<HashMap<usize, SSTable>>>,
+    pub sstables: Arc<RwLock<BTreeMap<usize, SSTable>>>,
     pub manifest: Arc<Mutex<Manifest>>,
     pub path: PathBuf,
     pub options: LSMStorageOptions,
@@ -36,8 +36,10 @@ pub enum FlushCommand<M: Memtable + Send + Sync + 'static> {
 
 impl<M: Memtable + Send + Sync> FlushSystem<M> {
     /// Spawns task with reciever for immutable memtables.
-    /// For each recieved memtable spawns task (number of tasks always <= flush_num_jobs) that
-    /// flushes it, writes metainfo into manifest, removes immutable memtable from LSMStorage, adds sstable to LSMStorage.
+    /// For each recieved memtable spawns task
+    /// (number of tasks always <= flush_num_jobs)
+    /// that flushes it, writes metainfo into manifest,
+    /// removes immutable memtable from LSMStorage, adds sstable to LSMStorage.
     pub fn init(self) -> FlushHandle<M> {
         let (tx, rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
         let path = Arc::new(self.path);
@@ -79,11 +81,9 @@ impl<M: Memtable + Send + Sync> FlushSystem<M> {
                                     .add_record(ManifestRecord::Flush(id))
                                     .unwrap();
 
-                                {
-                                    l0_sstables.write().await.push(id);
-                                    sstables.write().await.insert(id, sst);
-                                    imm_memtables.write().await.remove(&id);
-                                }
+                                sstables.write().await.insert(id, sst);
+                                l0_sstables.write().await.push(id);
+                                imm_memtables.write().await.remove(&id);
 
                                 drop(permit);
                             });

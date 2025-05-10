@@ -41,18 +41,15 @@ impl BlockBuilder {
             return false;
         }
 
-        // offset
         self.offsets.push(self.data.len() as u16);
-        // key len
         self.data.put_u16(key.len() as u16);
-        // key
         self.data.put(key);
         match value {
             Record::Delete => self.data.put_u8(1),
             Record::Put(val) => {
                 self.data.put_u8(0);
                 // value len
-                self.data.put_u16(val.len() as u16);
+                self.data.put_u32(val.len() as u32);
                 // value
                 self.data.put(val);
             }

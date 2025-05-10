@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fs::create_dir_all,
     path::{Path, PathBuf},
     sync::{
@@ -75,9 +75,10 @@ pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     path: PathBuf,                                  // Storage directory
     swap_lock: Mutex<()>,                           // Memtable swap synchronization
     memtable: RwLock<M>,                            // Active mutable memtable
-    imm_memtables: Arc<RwLock<HashMap<usize, M>>>,  // Frozen memtables by IDs
-    l0_tables: Arc<RwLock<Vec<usize>>>,             // SSTable IDs in L0
-    sstables: Arc<RwLock<HashMap<usize, SSTable>>>, // All SSTables by IDs
+    imm_memtables: Arc<RwLock<BTreeMap<usize, M>>>, // Frozen memtables by IDs
+    #[allow(dead_code)]
+    l0_tables: Arc<RwLock<Vec<usize>>>, // SSTable IDs in L0
+    sstables: Arc<RwLock<BTreeMap<usize, SSTable>>>, // All SSTables by IDs
     options: Arc<LSMStorageOptions>,                // Configuration
     next_sst_id: Arc<AtomicUsize>,                  // SSTable ID counter
     manifest: Arc<Mutex<Manifest>>,                 // Recovery log
@@ -100,7 +101,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let mut l0_tables = Vec::<usize>::new();
-        let mut sstables = HashMap::<usize, SSTable>::new();
+        let mut sstables = BTreeMap::<usize, SSTable>::new();
 
         let mut next_sst_id = 0_usize;
 
@@ -146,7 +147,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         // TODO: recover memtables from WALs..
 
         let memtable = RwLock::new(M::new(next_sst_id));
-        let imm_memtables = Arc::new(RwLock::new(HashMap::new()));
+        let imm_memtables = Arc::new(RwLock::new(BTreeMap::new()));
         let l0_tables = Arc::new(RwLock::new(l0_tables));
         let sstables = Arc::new(RwLock::new(sstables));
         let manifest = Arc::new(Mutex::new(manifest));
@@ -229,51 +230,45 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     }
 
     /// Retrieves value for key.
-    pub async fn get(&self, key: &impl AsRef<[u8]>) -> Option<Bytes> {
+    pub async fn get(&self, key: &impl AsRef<[u8]>) -> Result<Option<Bytes>> {
         let memtable = self.memtable.read().await;
         let key = key.as_ref();
 
         let mut candidate = memtable.get(key);
         if let Some(rec) = candidate {
-            return rec.into_inner();
+            return Ok(rec.into_inner());
         }
 
         let imm_memtables = self.imm_memtables.read().await;
         for memtable in imm_memtables.values() {
-            match memtable.get(key) {
-                None => continue,
-                Some(val) => candidate = Some(val),
+            let value = memtable.get(key);
+            if value.is_some() {
+                candidate = value;
             }
         }
 
         if let Some(rec) = candidate {
-            return rec.into_inner();
+            return Ok(rec.into_inner());
         }
 
+        drop(memtable);
         drop(imm_memtables);
 
-        let l0_tables = self.l0_tables.read().await;
         let sstables = self.sstables.read().await;
-        l0_tables.iter().for_each(|sst_id| {
-            // TODO: Propper error handling
-            let sst = sstables.get(sst_id).unwrap();
-            let try_get_value = sst.get(key);
-            // TODO: Propper error handling
-            if let Ok(maybe_value) = try_get_value {
-                if maybe_value.is_some() {
-                    candidate = maybe_value;
-                }
+        for sst in sstables.values() {
+            let value = sst.get(key)?;
+            if value.is_some() {
+                candidate = value;
             }
-        });
-
-        drop(sstables);
-        drop(l0_tables);
-
-        if let Some(rec) = candidate {
-            return rec.into_inner();
         }
 
-        None
+        if let Some(rec) = candidate {
+            return Ok(rec.into_inner());
+        }
+
+        drop(sstables);
+
+        Ok(None)
     }
 
     /// Deletes key.
@@ -286,32 +281,36 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
 
     // helper function for inserts.
     async fn insert_inner(&self, key: impl AsRef<[u8]>, value: Record) -> Result<()> {
-        let key = key.as_ref();
+        let key = Bytes::copy_from_slice(key.as_ref());
         if key.is_empty() {
             anyhow::bail!("Empty keys are not allowed");
         }
 
         let mut memtable = self.memtable.write().await;
-        memtable.set(Bytes::copy_from_slice(key), value);
+        memtable.set(key, value.clone());
 
         if memtable.size_estimate() > self.options.memtables_size {
-            drop(memtable);
-
             let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
             let new_memtable = M::new(old_id + 1);
-            let old_memtable = self.swap_memtable(new_memtable).await;
+            let old_memtable = {
+                let _lock = self.swap_lock.lock().await;
+                let old_memtable = memtable.clone();
+                *memtable = new_memtable;
+                old_memtable
+            };
+
+            drop(memtable);
 
             self.imm_memtables
                 .write()
                 .await
                 .insert(old_id, old_memtable.clone());
-            {
-                self.manifest
-                    .lock()
-                    .await
-                    .add_record(ManifestRecord::NewMemtable(old_id))
-                    .context("Failed to add NewMemtable record to manifest")?
-            }
+
+            self.manifest
+                .lock()
+                .await
+                .add_record(ManifestRecord::NewMemtable(old_id))
+                .context("Failed to add NewMemtable record to manifest")?;
 
             self.flush_handle
                 .sender
@@ -320,14 +319,6 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
                 .context("Failed to send memtable into flush channel")?;
         }
         Ok(())
-    }
-
-    async fn swap_memtable(&self, new_memtable: M) -> M {
-        let _lock = self.swap_lock.lock().await;
-        // let old_memtable = mem::replace(&mut self.memtable, new_memtable);
-        let old_memtable = self.memtable.write().await.clone();
-        *self.memtable.write().await = new_memtable;
-        old_memtable
     }
 }
 
@@ -346,25 +337,34 @@ mod lsm_storage_tests {
         let dir = tempdir()?;
         let storage = Storage::open(&dir, LSMStorageOptions::default())?;
 
-        storage.insert(b"key1", Bytes::from("val1")).await?;
-        assert_eq!(storage.get(&b"key1").await, Some(Bytes::from("val1")));
+        let expected = Bytes::from("val1");
+        let key = b"key";
+        storage.insert(&key, expected.clone()).await?;
+        let actual = storage.get(&key).await?;
 
-        storage.delete(&b"key1").await?;
-        assert_eq!(storage.get(&b"key1").await, None);
+        assert_eq!(actual, Some(expected));
+
+        storage.delete(&key).await?;
+        let actual = storage.get(&key).await?;
+
+        assert_eq!(actual, None);
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_persistence() -> Result<()> {
         let dir = tempdir()?;
-        {
-            let storage = Storage::open(&dir, LSMStorageOptions::default())?;
-            storage.insert(b"persisted", Bytes::from("data")).await?;
-            storage.close().await?;
-        }
 
         let storage = Storage::open(&dir, LSMStorageOptions::default())?;
-        assert_eq!(storage.get(&b"persisted").await, Some(Bytes::from("data")));
+        let key = b"key";
+        let expected = Bytes::from("data");
+        storage.insert(&key, expected.clone()).await?;
+        storage.close().await?;
+
+        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let actual = storage.get(&key).await?;
+        assert_eq!(actual, Some(expected));
         Ok(())
     }
 
@@ -379,12 +379,15 @@ mod lsm_storage_tests {
             },
         )?;
 
-        storage.insert(b"flushed", Bytes::from("value")).await?;
+        let key = b"key";
+        let expected = Bytes::from("data");
+        storage.insert(key.clone(), expected.clone()).await?;
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait for flush
-        storage.close().await.unwrap();
+        storage.close().await?;
 
         let storage = Storage::open(&dir, LSMStorageOptions::default())?;
-        assert_eq!(storage.get(&b"flushed").await, Some(Bytes::from("value")));
+        let actual = storage.get(key).await?;
+        assert_eq!(actual, Some(expected));
         Ok(())
     }
 }

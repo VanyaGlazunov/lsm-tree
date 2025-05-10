@@ -19,7 +19,7 @@ const SIZEOF_U16: usize = std::mem::size_of::<u16>();
 /// |                    |                | - **Key Length** (2 bytes): `u16` length of key                             |
 /// |                    |                | - **Key**: Raw key bytes                                                   |
 /// |                    |                | - **Tombstone** (1 byte): `0` = Put, `1` = Delete                          |
-/// |                    |                | - **Value Length** (2 bytes, optional): Only present for `Put` records     |
+/// |                    |                | - **Value Length** (4 bytes, optional): Only present for `Put` records     |
 /// |                    |                | - **Value** (optional): Raw value bytes for `Put`                          |
 /// | **Offsets**        | `Vec<u16>`     | Array of 2-byte offsets pointing to the start of each entry in `data`       |
 /// | **Footer**         | `u16`          | 2-byte count of entries (number of offsets)                                 |
@@ -95,16 +95,12 @@ impl BlockIterator<'_> {
 impl Iterator for BlockIterator<'_> {
     type Item = (Bytes, Record);
 
-    /// Yields next (key, Record) pair
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_idx >= self.offsets.len() {
             return None;
         }
 
         let start = self.offsets[self.current_idx] as usize;
-        if start >= self.data.len() {
-            return None;
-        }
 
         let mut entry = &self.data[start..];
         let key_len = entry.get_u16() as usize;
@@ -113,7 +109,7 @@ impl Iterator for BlockIterator<'_> {
 
         self.current_idx += 1;
         if tombstone == 0 {
-            let value_len = entry.get_u16() as usize;
+            let value_len = entry.get_u32() as usize;
             let value = &entry[..value_len];
             Some((key, Record::put_from_slice(value)))
         } else {
@@ -262,7 +258,7 @@ mod tests {
         assert_eq!(builder.size(), 2);
 
         builder.add(Bytes::from("k"), Record::put_from_slice("v"));
-        let expected_size = 11;
+        let expected_size = 13;
         assert_eq!(builder.size(), expected_size);
     }
 

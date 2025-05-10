@@ -236,7 +236,7 @@ mod tests {
         }
 
         let sstable = SSTable::open(path)?;
-        assert_eq!(sstable.meta.len(), 3);
+        assert_eq!(sstable.meta.len(), 6);
         assert_eq!(sstable.first_key(), Bytes::from("a"));
         assert_eq!(sstable.last_key(), Bytes::from("f"));
 
