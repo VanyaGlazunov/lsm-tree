@@ -72,6 +72,27 @@ proptest! {
 }
 
 #[tokio::test]
+async fn test_sstable_priority() -> Result<()> {
+    let dir = tempdir()?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let key = b"key";
+
+    let old = Bytes::from("old");
+    let new = Bytes::from("new");
+    storage.insert(key, old).await?;
+    storage.close().await?;
+
+    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    storage.insert(key, new.clone()).await?;
+    storage.close().await?;
+
+    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let actual = storage.get(key).await?;
+    assert_eq!(actual, Some(new));
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_concurrent_write_non_overlapping_keys() -> Result<()> {
     let dir = tempdir()?;
     let storage = Arc::new(Storage::open(

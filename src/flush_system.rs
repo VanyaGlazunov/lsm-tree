@@ -23,12 +23,14 @@ pub(crate) struct FlushSystem<M: Memtable + Send + Sync> {
     pub options: LSMStorageOptions,
 }
 
+/// Handle to operate on flush channel.
 #[derive(Debug)]
 pub struct FlushHandle<M: Memtable + Send + Sync + 'static> {
     pub handle: JoinHandle<()>,
     pub sender: tokio::sync::mpsc::Sender<FlushCommand<M>>,
 }
 
+/// Types of comands in flush channel.
 pub enum FlushCommand<M: Memtable + Send + Sync + 'static> {
     Memtable(M),
     Shutdown,

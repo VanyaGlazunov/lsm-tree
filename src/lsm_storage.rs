@@ -1,11 +1,8 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::create_dir_all,
-    path::{Path, PathBuf},
-    sync::{
+    collections::{BTreeMap, BTreeSet}, fs::create_dir_all, mem::replace, path::{Path, PathBuf}, sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
-    },
+    }
 };
 
 use anyhow::{Context, Result};
@@ -56,8 +53,8 @@ impl Record {
     }
 }
 
-#[derive(Clone)]
 /// Configuration for [LSMStorage]
+#[derive(Clone)]
 pub struct LSMStorageOptions {
     /// Size of a block in SSTable.
     pub block_size: usize,
@@ -141,10 +138,11 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             }
         } else {
             manifest = Manifest::new(manifest_path)?;
-            manifest.add_record(ManifestRecord::NewMemtable(0))?;
         }
 
         // TODO: recover memtables from WALs..
+
+        manifest.add_record(ManifestRecord::NewMemtable(next_sst_id))?;
 
         let memtable = RwLock::new(M::new(next_sst_id));
         let imm_memtables = Arc::new(RwLock::new(BTreeMap::new()));
@@ -292,25 +290,24 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         if memtable.size_estimate() > self.options.memtables_size {
             let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
             let new_memtable = M::new(old_id + 1);
+
             let old_memtable = {
                 let _lock = self.swap_lock.lock().await;
-                let old_memtable = memtable.clone();
-                *memtable = new_memtable;
-                old_memtable
+                replace(&mut *memtable, new_memtable)
             };
 
             drop(memtable);
-
-            self.imm_memtables
-                .write()
-                .await
-                .insert(old_id, old_memtable.clone());
 
             self.manifest
                 .lock()
                 .await
                 .add_record(ManifestRecord::NewMemtable(old_id))
                 .context("Failed to add NewMemtable record to manifest")?;
+
+            self.imm_memtables
+                .write()
+                .await
+                .insert(old_id, old_memtable.clone());
 
             self.flush_handle
                 .sender
@@ -319,6 +316,10 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
                 .context("Failed to send memtable into flush channel")?;
         }
         Ok(())
+    }
+
+    pub fn force_flush(&self) {
+        todo!()
     }
 }
 
