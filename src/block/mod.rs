@@ -1,10 +1,15 @@
 pub(crate) mod builder;
 
-use bytes::{Buf, BufMut, Bytes};
+use bincode::{
+    config::{Config, Configuration, Fixint, LittleEndian, NoLimit},
+    decode_from_slice, encode_to_vec, Decode, Encode,
+};
+use builder::BlockEntry;
+use bytes::Bytes;
 
 use crate::lsm_storage::Record;
 
-const SIZEOF_U16: usize = std::mem::size_of::<u16>();
+const SIZEOF_U64: usize = std::mem::size_of::<u64>();
 
 /// A fixed-size storage unit containing key-value entries and offset metadata.
 ///
@@ -23,37 +28,28 @@ const SIZEOF_U16: usize = std::mem::size_of::<u16>();
 /// |                    |                | - **Value** (optional): Raw value bytes for `Put`                          |
 /// | **Offsets**        | `Vec<u16>`     | Array of 2-byte offsets pointing to the start of each entry in `data`       |
 /// | **Footer**         | `u16`          | 2-byte count of entries (number of offsets)                                 |
-///
-/// **Encoding Process**:
-/// 1. Entries are packed into `data` sequentially.
-/// 2. Offsets are appended after all entries.
-/// 3. Footer (offsets count) is written as the last 2 bytes.
-#[derive(Debug)]
+
+#[derive(Debug, Encode, Decode)]
 pub struct Block {
-    pub data: Vec<u8>,
-    pub offsets: Vec<u16>,
+    pub entries: Vec<BlockEntry>,
+}
+
+fn bincode_config() -> impl Config {
+    Configuration::<LittleEndian, Fixint, NoLimit>::default()
 }
 
 impl Block {
     /// Creates an iterator over the block's entries
     pub fn iter(&self) -> BlockIterator {
         BlockIterator {
-            data: &self.data,
-            offsets: &self.offsets,
+            entries: &self.entries,
             current_idx: 0,
         }
     }
 
     /// Serializes block into [Bytes]
-    pub fn encode(self) -> Bytes {
-        let mut buf = self.data;
-        let offsets_len = self.offsets.len();
-        for offset in self.offsets {
-            buf.put_u16(offset);
-        }
-
-        buf.put_u16(offsets_len as u16);
-        buf.into()
+    pub fn encode(self) -> Vec<u8> {
+        encode_to_vec(self, bincode_config()).unwrap()
     }
 
     /// Reconstructs block from byte slice
@@ -61,34 +57,22 @@ impl Block {
     /// #Panics
     /// - May panic if the block is corrupted/invalid. To prevent this use [builder::BlockBuilder] to build blocks.
     pub fn decode(buf: &[u8]) -> Self {
-        let offsets_len = (&buf[buf.len() - SIZEOF_U16..]).get_u16() as usize;
-        let data_end = buf.len() - SIZEOF_U16 - SIZEOF_U16 * offsets_len;
-        let offsets_raw = &buf[data_end..buf.len() - SIZEOF_U16];
-        let offsets = offsets_raw
-            .chunks(SIZEOF_U16)
-            .map(|mut x| x.get_u16())
-            .collect();
-        let data = buf[0..data_end].to_vec();
-        Self { data, offsets }
+        decode_from_slice(buf, bincode_config()).unwrap().0
     }
 }
 
 /// Iterator for scanning entries in a [Block]
 pub struct BlockIterator<'a> {
-    data: &'a [u8],
-    offsets: &'a [u16],
+    entries: &'a [BlockEntry],
     current_idx: usize,
 }
 
 impl BlockIterator<'_> {
     /// Binary search to first entry with key >= target.
     pub fn seek(&mut self, target: &[u8]) {
-        self.current_idx = self.offsets.partition_point(|&offset| {
-            let mut entry = &self.data[offset as usize..];
-            let key_len = entry.get_u16() as usize;
-            let key = &entry[..key_len];
-            key < target
-        });
+        self.current_idx = self
+            .entries
+            .partition_point(|entry| &entry.key[..] < target);
     }
 }
 
@@ -96,25 +80,20 @@ impl Iterator for BlockIterator<'_> {
     type Item = (Bytes, Record);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_idx >= self.offsets.len() {
+        if self.current_idx >= self.entries.len() {
             return None;
         }
 
-        let start = self.offsets[self.current_idx] as usize;
-
-        let mut entry = &self.data[start..];
-        let key_len = entry.get_u16() as usize;
-        let key = entry.copy_to_bytes(key_len);
-        let tombstone = entry.get_u8();
+        let BlockEntry { key, value } = &self.entries[self.current_idx];
+        let key = Bytes::from(key.clone());
+        let value = match value {
+            None => Record::Delete,
+            Some(val) => Record::Put(val.clone().into()),
+        };
 
         self.current_idx += 1;
-        if tombstone == 0 {
-            let value_len = entry.get_u32() as usize;
-            let value = &entry[..value_len];
-            Some((key, Record::put_from_slice(value)))
-        } else {
-            Some((key, Record::Delete))
-        }
+
+        Some((key, value))
     }
 }
 
@@ -130,13 +109,11 @@ mod tests {
     fn test_empty_block() {
         let builder = BlockBuilder::new(1024);
         let block = builder.build();
-        assert!(block.data.is_empty());
-        assert!(block.offsets.is_empty());
+        assert!(block.entries.is_empty());
 
         let encoded = block.encode();
         let decoded = Block::decode(&encoded);
-        assert!(decoded.data.is_empty());
-        assert!(decoded.offsets.is_empty());
+        assert!(decoded.entries.is_empty());
     }
 
     #[test]
@@ -180,15 +157,14 @@ mod tests {
 
     #[test]
     fn test_block_boundary() {
-        // (2 + 2 + 2 + 4 + 2) * 3 + 2 = 38
-        let mut builder = BlockBuilder::new(37); // 3 entries will fill exactly 38 bytes
+        let mut builder = BlockBuilder::new(54); // 3 entries will fill exactly 54 bytes
         assert!(builder.add(Bytes::from("k1"), Record::put_from_slice("val1")));
         assert!(builder.add(Bytes::from("k2"), Record::put_from_slice("val2")));
 
         assert!(!builder.add(Bytes::from("k3"), Record::put_from_slice("val3")));
 
         let block = builder.build();
-        assert_eq!(block.offsets.len(), 2);
+        assert_eq!(block.entries.len(), 2);
     }
 
     #[test]
@@ -227,7 +203,7 @@ mod tests {
     fn test_corrupted_data() {
         let invalid_data = vec![0u8; 10];
         let decoded = Block::decode(&invalid_data);
-        assert!(decoded.offsets.is_empty());
+        assert!(decoded.entries.is_empty());
     }
 
     #[test]
@@ -255,10 +231,10 @@ mod tests {
     #[test]
     fn test_size() {
         let mut builder = BlockBuilder::new(1024);
-        assert_eq!(builder.size(), 2);
+        assert_eq!(builder.size(), 8);
 
         builder.add(Bytes::from("k"), Record::put_from_slice("v"));
-        let expected_size = 13;
+        let expected_size = 27;
         assert_eq!(builder.size(), expected_size);
     }
 
@@ -271,6 +247,6 @@ mod tests {
         ));
 
         let block = builder.build();
-        assert_eq!(block.offsets.len(), 1);
+        assert_eq!(block.entries.len(), 1);
     }
 }

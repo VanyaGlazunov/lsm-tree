@@ -27,11 +27,6 @@ pub trait Memtable {
 }
 
 /// Memtable implementation based on [BTreeMap]
-///
-/// # Fields
-/// - `id`: Unique identifier
-/// - `size`: Estimated data size (bytes)
-/// - `container`: Actual key-value storage
 #[derive(Clone, Debug)]
 pub struct BtreeMapMemtable {
     id: usize,

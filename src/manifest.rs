@@ -1,6 +1,6 @@
 use anyhow::{Context, Ok, Result};
+use bincode::{config::standard, decode_from_slice, encode_to_vec, Decode, Encode};
 use bytes::Buf;
-use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -15,7 +15,7 @@ pub(crate) struct Manifest {
 }
 
 /// Operations types logged in manifest.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Encode, Decode, Debug)]
 pub(crate) enum ManifestRecord {
     NewMemtable(usize), // Creation of memtable with given ID
     Flush(usize),       // Flush of a memtable with given ID
@@ -47,16 +47,19 @@ impl Manifest {
             .read(true)
             .open(path)
             .context("Failed to open manifest")?;
+
         let mut buf = Vec::<u8>::new();
         file.read_to_end(&mut buf)
             .context("Failed to read manifest file")?;
         let mut buf = &buf[..];
+
         let mut records = Vec::<ManifestRecord>::new();
         while buf.has_remaining() {
             let len = buf.get_u64() as usize;
             let data = &buf[..len];
-            let record = serde_json::from_slice::<ManifestRecord>(data)
-                .context("Failed to deserealize record")?;
+            let record = decode_from_slice(data, standard())
+                .context("Failed to deserealize record")?
+                .0;
             buf.advance(len);
             records.push(record);
         }
@@ -71,12 +74,17 @@ impl Manifest {
     /// Adds record and fsyncs
     pub fn add_record(&self, record: ManifestRecord) -> Result<()> {
         let mut file = self.file.lock().unwrap();
-        let buf = serde_json::to_vec(&record).context("Failed to serialize record")?;
+
+        let buf = encode_to_vec(record, standard())?;
+
         file.write_all(&buf.len().to_be_bytes())
             .context("Failed to wrtie record len to file")?;
+
         file.write_all(&buf)
             .context("Failed to write record to file")?;
+
         file.sync_all().context("Failed to sync file")?;
+
         Ok(())
     }
 }

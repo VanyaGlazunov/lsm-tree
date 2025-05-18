@@ -1,8 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet}, fs::create_dir_all, mem::replace, path::{Path, PathBuf}, sync::{
+    collections::{BTreeMap, BTreeSet},
+    fs::create_dir_all,
+    mem::replace,
+    path::{Path, PathBuf},
+    sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
-    }
+    },
 };
 
 use anyhow::{Context, Result};
