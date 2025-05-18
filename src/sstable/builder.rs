@@ -1,20 +1,24 @@
 use std::{fs::OpenOptions, io::Write, path::Path};
 
 use anyhow::{Context, Result};
+use bloomfilter::Bloom;
 use bytes::{BufMut, Bytes};
 
 use crate::{block::builder::BlockBuilder, lsm_storage::Record};
 
 use super::{BlockMeta, SSTable};
 
+const RP_RATE: f64 = 0.001;
+
 /// Constructs SSTable from key-value stream.
 pub struct SSTableBuilder {
     block_builder: BlockBuilder, // Current block
     target_block_size: usize,    // Block size limit
     data: Vec<u8>,               // Serialized blocks
-    meta: Vec<BlockMeta>,        // Meta data for each block
-    current_first_key: Bytes,    // First key in current block
-    current_last_key: Bytes,     // Last key in current block
+    keys: Vec<Bytes>,
+    meta: Vec<BlockMeta>,     // Meta data for each block
+    current_first_key: Bytes, // First key in current block
+    current_last_key: Bytes,  // Last key in current block
 }
 
 impl SSTableBuilder {
@@ -24,6 +28,7 @@ impl SSTableBuilder {
             block_builder: BlockBuilder::new(target_block_size),
             target_block_size,
             data: Vec::new(),
+            keys: Vec::new(),
             meta: Vec::new(),
             current_first_key: Bytes::new(),
             current_last_key: Bytes::new(),
@@ -35,6 +40,8 @@ impl SSTableBuilder {
         if self.current_first_key.is_empty() {
             self.current_first_key = key.clone();
         }
+
+        self.keys.push(key.clone());
 
         if self.block_builder.add(key.clone(), value.clone()) {
             self.current_last_key = key;
@@ -85,6 +92,10 @@ impl SSTableBuilder {
 
     /// Finilizes SSTable and writes on disk all serialized data (also fsyncs).
     pub fn build(mut self, path: impl AsRef<Path>) -> Result<SSTable> {
+        if self.current_first_key.is_empty() {
+            anyhow::bail!("Empty SSTables are not allowed");
+        }
+
         self.finish_block();
 
         let mut file = OpenOptions::new()
@@ -100,25 +111,27 @@ impl SSTableBuilder {
 
         let mut buf = self.data;
         buf.extend(meta_bytes);
+
+        let bloom_offset = buf.len();
+
+        // TODO:
+        let mut bloom = Bloom::new_for_fp_rate(self.keys.len(), RP_RATE).unwrap();
+        self.keys.into_iter().for_each(|key| bloom.set(&*key));
+
+        buf.extend(bloom.as_slice());
+
+        buf.put_u32((bloom_offset - meta_offset) as u32);
         buf.put_u32(meta_offset as u32);
+
         file.write_all(&buf).context("Failed to write sstablw")?;
         file.sync_all().context("Failed to sync sstable file")?;
 
         Ok(SSTable {
             file,
-            first_key: self
-                .meta
-                .first()
-                .context("No first key in sstable -> It is empty")?
-                .first_key
-                .clone(),
-            last_key: self
-                .meta
-                .last()
-                .context("No last key in sstable -> It is empty")?
-                .last_key
-                .clone(),
+            first_key: self.meta.first().unwrap().first_key.clone(),
+            last_key: self.meta.last().unwrap().last_key.clone(),
             meta: self.meta,
+            bloom,
             meta_block_offset: meta_offset,
         })
     }

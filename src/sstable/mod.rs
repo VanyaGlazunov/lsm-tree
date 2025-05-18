@@ -8,9 +8,10 @@ use std::{
 
 use crate::{block::Block, lsm_storage::Record};
 use anyhow::{Context, Result};
+use bloomfilter::Bloom;
 use bytes::{Buf, Bytes};
 
-const FOOTER_SIZE: usize = std::mem::size_of::<u32>();
+const OFFSET_SIZE: usize = std::mem::size_of::<u32>();
 
 #[derive(Debug)]
 pub struct BlockMeta {
@@ -21,37 +22,12 @@ pub struct BlockMeta {
 
 /// On-disk sorted key-value data.
 ///
-/// # SSTable Format (On-Disk)
-///
-/// | Component               | Data Type/Format                 | Description                                                                  |
-/// |-------------------------|----------------------------------|------------------------------------------------------------------------------|
-/// | **Data Blocks**         | Serialized `Block` entries       |  Sequence of encoded blocks containing key-value pairs (see Block format).   |
-/// |                         |                                  |  Blocks are written contiguously.                                            |
-/// |                         |                                  |                                                                              |
-/// | **Metadata Section**    | Binary format                    |  Contains metadata for all blocks:                                           |
-/// |                         | - `u32`: Number of blocks        |  - For each block:                                                           |
-/// |                         | - Per block:                     |    - `u32`: Block offset in file                                             |
-/// |                         |   - `u16`: First key length      |    - `u16`: First key length + raw bytes                                     |
-/// |                         |   - `[u8]`: First key            |    - `u16`: Last key length + raw bytes                                      |
-/// |                         |   - `u16`: Last key length       |                                                                              |
-/// |                         |   - `[u8]`: Last key             |                                                                              |
-/// | **Footer**              | 8 bytes                          |  Final file section:                                                         |
-/// |                         | - `u32`: Metadata offset         |  Offset to start of metadata section                                         |
-/// |                         | - `u32`: Metadata length         |  Length of metadata section (bytes)                                          |
-///
-///
-/// ## Encoding Process
-/// 1. **Blocks**  
-///    - Write blocks sequentially to file
-/// 2. **Metadata**  
-///    - Serialize metadata after all blocks:
-/// 3. **Footer**  
-///    - Append metadata offset + length as last 8 bytes
 #[derive(Debug)]
 pub struct SSTable {
     file: File,               // Underlying file
     meta: Vec<BlockMeta>,     // Blocks' meta data
     meta_block_offset: usize, // Offset of meta block in file
+    bloom: Bloom<[u8]>,       // Bloom filter to speed up lookup
     first_key: Bytes,         // First key in SSTable
     last_key: Bytes,          // Last key in SSTable
 }
@@ -99,26 +75,30 @@ impl SSTable {
             .context("Failed to open sstable file")?;
 
         let file_size = file.metadata()?.len() as usize;
-        if file_size < FOOTER_SIZE {
+        if file_size < OFFSET_SIZE {
             anyhow::bail!("SSTable file is too small to be valid");
         }
 
-        let mut footer = [0u8; FOOTER_SIZE];
-        let footer_offset = file_size - FOOTER_SIZE;
-        file.read_exact_at(&mut footer, footer_offset as u64)
-            .context("Failed to read footer")?;
+        let mut meta_offset = [0u8; OFFSET_SIZE];
+        file.read_exact_at(&mut meta_offset, (file_size - OFFSET_SIZE) as u64)
+            .context("Failed to read meta offset")?;
 
-        let meta_offset = (&footer[..]).get_u32() as usize;
-        if meta_offset >= file_size - FOOTER_SIZE {
-            anyhow::bail!("Invalid metadata offset");
+        let meta_offset = (&meta_offset[..]).get_u32() as usize;
+        if meta_offset >= file_size - OFFSET_SIZE {
+            anyhow::bail!("Invalid meta offset");
         }
 
-        let meta_section_length = file_size - meta_offset - FOOTER_SIZE;
-        let mut meta_bytes = vec![0; meta_section_length];
-        file.read_exact_at(&mut meta_bytes, meta_offset as u64)
-            .context("Failed to read metadata")?;
+        let meta_length = file_size - meta_offset - OFFSET_SIZE;
+        let mut buf = vec![0; meta_length];
+        file.read_exact_at(&mut buf, meta_offset as u64)
+            .context("Failed to read meta")?;
 
-        let meta = deserialize_metadata(&meta_bytes);
+        let meta_length = (&buf[buf.len() - OFFSET_SIZE..]).get_u32() as usize;
+        let meta_bytes = &buf[..meta_length];
+
+        let meta = deserialize_metadata(meta_bytes);
+
+        let bloom = Bloom::<[u8]>::from_slice(&buf[meta_length..buf.len() - OFFSET_SIZE]).unwrap();
 
         let first_key = meta
             .first()
@@ -135,6 +115,7 @@ impl SSTable {
             file,
             meta,
             meta_block_offset: meta_offset,
+            bloom,
             first_key,
             last_key,
         })
@@ -142,6 +123,10 @@ impl SSTable {
 
     /// Lookups given key in SSTable
     pub fn get(&self, key: &[u8]) -> Result<Option<Record>> {
+        if !self.bloom.check(key) {
+            return Ok(None);
+        }
+
         // Index of the first block with first_key >= key.
         let partition_point = self.meta.partition_point(|block| block.first_key <= key);
 
@@ -181,12 +166,6 @@ impl SSTable {
             .context("Failed to read block data")?;
 
         Ok(Block::decode(&buf[..]))
-    }
-}
-
-impl FromIterator<(Bytes, Record)> for SSTable {
-    fn from_iter<T: IntoIterator<Item = (Bytes, Record)>>(_iter: T) -> Self {
-        todo!()
     }
 }
 
