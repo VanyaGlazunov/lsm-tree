@@ -15,7 +15,7 @@ TODO
 ### Refactoring
 - [] Propper error handling
 - [x] Tombstone logic is week (i.e user can replicate tombstone)
-- [] Manual flush
+- [x] Manual flush
 
 ### Priority features
 - [] Write ahead log for memtables
@@ -24,7 +24,7 @@ TODO
 
 ### Performance optimizations
 - [] Skip list based Memtable implementaion (lock-free)
-- [] Bloom filters for SSTables
+- [x] Bloom filters for SSTables
 - [] Compression for SSTables
 
 ### Administration features
