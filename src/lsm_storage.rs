@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, RwLockWriteGuard},
 };
 
 use crate::{
@@ -292,38 +292,46 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         memtable.set(key, value.clone());
 
         if memtable.size_estimate() > self.options.memtables_size {
-            let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-            let new_memtable = M::new(old_id + 1);
-
-            let old_memtable = {
-                let _lock = self.swap_lock.lock().await;
-                replace(&mut *memtable, new_memtable)
-            };
-
-            drop(memtable);
-
-            self.manifest
-                .lock()
-                .await
-                .add_record(ManifestRecord::NewMemtable(old_id))
-                .context("Failed to add NewMemtable record to manifest")?;
-
-            self.imm_memtables
-                .write()
-                .await
-                .insert(old_id, old_memtable.clone());
-
-            self.flush_handle
-                .sender
-                .send(FlushCommand::Memtable(old_memtable))
-                .await
-                .context("Failed to send memtable into flush channel")?;
+            self.flush(memtable).await.context("Failed to flush")?;
         }
+
         Ok(())
     }
 
-    pub fn force_flush(&self) {
-        todo!()
+    pub async fn force_flush(&self) -> Result<()> {
+        let memtable = self.memtable.write().await;
+        self.flush(memtable).await
+    }
+
+    async fn flush(&self, mut memtable: RwLockWriteGuard<'_, M>) -> Result<()> {
+        let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let new_memtable = M::new(old_id + 1);
+
+        let old_memtable = {
+            let _lock = self.swap_lock.lock().await;
+            replace(&mut *memtable, new_memtable)
+        };
+
+        self.manifest
+            .lock()
+            .await
+            .add_record(ManifestRecord::NewMemtable(old_id))
+            .context("Failed to add NewMemtable record to manifest")?;
+
+        self.imm_memtables
+            .write()
+            .await
+            .insert(old_id, old_memtable.clone());
+
+        drop(memtable);
+
+        self.flush_handle
+            .sender
+            .send(FlushCommand::Memtable(old_memtable))
+            .await
+            .context("Failed to send memtable into flush channel")?;
+
+        Ok(())
     }
 }
 
