@@ -8,7 +8,7 @@ use crate::{block::builder::BlockBuilder, lsm_storage::Record};
 
 use super::{BlockMeta, SSTable};
 
-const RP_RATE: f64 = 0.001;
+const FP_RATE: f64 = 0.001;
 
 /// Constructs SSTable from key-value stream.
 pub struct SSTableBuilder {
@@ -115,7 +115,7 @@ impl SSTableBuilder {
         let bloom_offset = buf.len();
 
         // TODO:
-        let mut bloom = Bloom::new_for_fp_rate(self.keys.len(), RP_RATE).unwrap();
+        let mut bloom = Bloom::new_for_fp_rate(self.keys.len(), FP_RATE).unwrap();
         self.keys.into_iter().for_each(|key| bloom.set(&*key));
 
         buf.extend(bloom.as_slice());
