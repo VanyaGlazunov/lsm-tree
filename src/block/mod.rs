@@ -12,23 +12,6 @@ use crate::lsm_storage::Record;
 const SIZEOF_U64: usize = std::mem::size_of::<u64>();
 
 /// A fixed-size storage unit containing key-value entries and offset metadata.
-///
-/// # Fields
-/// - `data`: Serialized key-value entries (binary format)
-/// - `offsets`: Array of u16 offsets pointing to entry locations in `data`
-/// ## Block Format (On-Disk)
-///
-/// | Component          | Data Type      | Description                                                                 |
-/// |---------------------|----------------|-----------------------------------------------------------------------------|
-/// | **Data**           | `Vec<u8>`      | Serialized entries in binary format. Each entry contains:                   |
-/// |                    |                | - **Key Length** (2 bytes): `u16` length of key                             |
-/// |                    |                | - **Key**: Raw key bytes                                                   |
-/// |                    |                | - **Tombstone** (1 byte): `0` = Put, `1` = Delete                          |
-/// |                    |                | - **Value Length** (4 bytes, optional): Only present for `Put` records     |
-/// |                    |                | - **Value** (optional): Raw value bytes for `Put`                          |
-/// | **Offsets**        | `Vec<u16>`     | Array of 2-byte offsets pointing to the start of each entry in `data`       |
-/// | **Footer**         | `u16`          | 2-byte count of entries (number of offsets)                                 |
-
 #[derive(Debug, Encode, Decode)]
 pub struct Block {
     pub entries: Vec<BlockEntry>,

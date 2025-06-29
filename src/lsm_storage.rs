@@ -31,6 +31,10 @@ const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
 const DEFAULT_MEMTABLE_CAP: usize = 2;
 const DEFAULT_NUM_FLUSH_WORKERS: usize = 2;
 
+pub type ImmutableMemtableMap<M> = Arc<RwLock<BTreeMap<usize, Arc<M>>>>;
+pub type SSTableMap = Arc<RwLock<BTreeMap<usize, SSTable>>>;
+pub type L0TaablesList = Arc<RwLock<Vec<usize>>>;
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum Record {
     Put(Bytes),
@@ -73,17 +77,17 @@ pub struct LSMStorageOptions {
 
 /// Main storage engine.
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
-    path: PathBuf,                                  // Storage directory
-    swap_lock: Mutex<()>,                           // Memtable swap synchronization
-    memtable: RwLock<M>,                            // Active mutable memtable
-    imm_memtables: Arc<RwLock<BTreeMap<usize, M>>>, // Frozen memtables by IDs
+    path: PathBuf,                          // Storage directory
+    swap_lock: Mutex<()>,                   // Memtable swap synchronization
+    memtable: RwLock<M>,                    // Active mutable memtable
+    imm_memtables: ImmutableMemtableMap<M>, // Frozen memtables by IDs
     #[allow(dead_code)]
-    l0_tables: Arc<RwLock<Vec<usize>>>, // SSTable IDs in L0
-    sstables: Arc<RwLock<BTreeMap<usize, SSTable>>>, // All SSTables by IDs
-    options: Arc<LSMStorageOptions>,                // Configuration
-    next_sst_id: Arc<AtomicUsize>,                  // SSTable ID counter
-    manifest: Arc<Mutex<Manifest>>,                 // Recovery log
-    flush_handle: Arc<FlushHandle<M>>,              // Background flush system handle
+    l0_tables: L0TaablesList, // SSTable IDs in L0
+    sstables: SSTableMap,                   // All SSTables by IDs
+    options: Arc<LSMStorageOptions>,        // Configuration
+    next_sst_id: Arc<AtomicUsize>,          // SSTable ID counter
+    manifest: Arc<Mutex<Manifest>>,         // Recovery log
+    flush_handle: Arc<FlushHandle<M>>,      // Background flush system handle
 }
 
 impl Default for LSMStorageOptions {
@@ -149,7 +153,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         manifest.add_record(ManifestRecord::NewMemtable(next_sst_id))?;
 
         let memtable = RwLock::new(M::new(next_sst_id));
-        let imm_memtables = Arc::new(RwLock::new(BTreeMap::new()));
+        let imm_memtables: ImmutableMemtableMap<M> = Arc::new(RwLock::new(BTreeMap::new()));
         let l0_tables = Arc::new(RwLock::new(l0_tables));
         let sstables = Arc::new(RwLock::new(sstables));
         let manifest = Arc::new(Mutex::new(manifest));
@@ -212,7 +216,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let imm_memtables = Arc::try_unwrap(imm_memtables).unwrap().into_inner();
         for memtable in imm_memtables.values() {
             let id = memtable.get_id();
-            flush_memtable(options.block_size, &path, memtable).await?;
+            flush_memtable(options.block_size, &path, &**memtable).await?;
 
             manifest
                 .lock()
@@ -281,7 +285,6 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         self.insert_inner(key, TOMBSTONE).await
     }
 
-    // helper function for inserts.
     async fn insert_inner(&self, key: impl AsRef<[u8]>, value: Record) -> Result<()> {
         let key = Bytes::copy_from_slice(key.as_ref());
         if key.is_empty() {
@@ -298,6 +301,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         Ok(())
     }
 
+    /// Forces flush of current memtable.
     pub async fn force_flush(&self) -> Result<()> {
         let memtable = self.memtable.write().await;
         self.flush(memtable).await
@@ -311,6 +315,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             let _lock = self.swap_lock.lock().await;
             replace(&mut *memtable, new_memtable)
         };
+        let old_memtable = Arc::new(old_memtable);
 
         self.manifest
             .lock()

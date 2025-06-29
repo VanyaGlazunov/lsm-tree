@@ -7,6 +7,7 @@ use tokio::{
 
 use crate::lsm_storage::FLUSH_CHANNEL_SIZE;
 use crate::{
+    lsm_storage::ImmutableMemtableMap,
     lsm_storage::LSMStorageOptions,
     lsm_utils::flush_memtable,
     manifest::{Manifest, ManifestRecord},
@@ -15,7 +16,7 @@ use crate::{
 };
 
 pub(crate) struct FlushSystem<M: Memtable + Send + Sync> {
-    pub imm_memtables: Arc<RwLock<BTreeMap<usize, M>>>,
+    pub imm_memtables: ImmutableMemtableMap<M>,
     pub l0_tables: Arc<RwLock<Vec<usize>>>,
     pub sstables: Arc<RwLock<BTreeMap<usize, SSTable>>>,
     pub manifest: Arc<Mutex<Manifest>>,
@@ -32,8 +33,13 @@ pub struct FlushHandle<M: Memtable + Send + Sync + 'static> {
 
 /// Types of comands in flush channel.
 pub enum FlushCommand<M: Memtable + Send + Sync + 'static> {
-    Memtable(M),
+    Memtable(Arc<M>),
     Shutdown,
+}
+
+pub struct FlushResult {
+    pub id: usize,
+    pub sstable: SSTable,
 }
 
 impl<M: Memtable + Send + Sync> FlushSystem<M> {
@@ -72,7 +78,7 @@ impl<M: Memtable + Send + Sync> FlushSystem<M> {
                                 let sst = flush_memtable(
                                     self.options.block_size,
                                     path.as_path(),
-                                    &memtable,
+                                    &*memtable,
                                 )
                                 .await
                                 .unwrap();
