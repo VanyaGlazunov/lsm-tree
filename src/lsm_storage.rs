@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    flush_system::{start_flush_workers, FlushCommand},
+    flush_system::start_flush_workers,
     lsm_utils::{flush_memtable, get_sst_path},
     manifest::{Manifest, ManifestRecord},
     memtable::Memtable,
@@ -89,7 +89,7 @@ pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     next_sst_id: Arc<AtomicUsize>,          // SSTable ID counter
     manifest: Arc<Mutex<Manifest>>,         // Recovery log
     state_update_handle: JoinHandle<()>,
-    flush_sender: Sender<FlushCommand<M>>,
+    flush_sender: Sender<Arc<M>>,
 }
 
 impl Default for LSMStorageOptions {
@@ -216,8 +216,6 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
                 .add_record(ManifestRecord::Flush(id))?;
         }
 
-        self.flush_sender.send(FlushCommand::Shutdown).await?;
-
         drop(self.flush_sender);
 
         self.state_update_handle.await?;
@@ -293,7 +291,9 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         memtable.set(key, value.clone());
 
         if memtable.size_estimate() > self.options.memtables_size {
-            self.flush(memtable).await.context("Failed to flush")?;
+            self.flush(memtable)
+                .await
+                .context("Failed to start flushing")?;
         }
 
         Ok(())
@@ -326,12 +326,12 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             .await
             .insert(old_id, old_memtable.clone());
 
-        drop(memtable);
-
         self.flush_sender
-            .send(FlushCommand::Memtable(old_memtable))
+            .send(old_memtable)
             .await
             .context("Failed to send memtable into flush channel")?;
+
+        drop(memtable);
 
         Ok(())
     }
