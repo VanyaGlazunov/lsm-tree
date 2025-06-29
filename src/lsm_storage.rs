@@ -13,11 +13,12 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{Mutex, RwLock, RwLockWriteGuard},
+    sync::{mpsc::Sender, Mutex, RwLock, RwLockWriteGuard},
+    task::JoinHandle,
 };
 
 use crate::{
-    flush_system::{FlushCommand, FlushHandle, FlushSystem},
+    flush_system::{start_flush_workers, FlushCommand},
     lsm_utils::{flush_memtable, get_sst_path},
     manifest::{Manifest, ManifestRecord},
     memtable::Memtable,
@@ -87,7 +88,8 @@ pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     options: Arc<LSMStorageOptions>,        // Configuration
     next_sst_id: Arc<AtomicUsize>,          // SSTable ID counter
     manifest: Arc<Mutex<Manifest>>,         // Recovery log
-    flush_handle: Arc<FlushHandle<M>>,      // Background flush system handle
+    state_update_handle: JoinHandle<()>,
+    flush_sender: Sender<FlushCommand<M>>,
 }
 
 impl Default for LSMStorageOptions {
@@ -158,15 +160,34 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let sstables = Arc::new(RwLock::new(sstables));
         let manifest = Arc::new(Mutex::new(manifest));
 
-        let flush_system = FlushSystem {
-            imm_memtables: imm_memtables.clone(),
-            l0_tables: l0_tables.clone(),
-            sstables: sstables.clone(),
-            manifest: manifest.clone(),
-            path: path.to_path_buf(),
-            options: options.clone(),
-        };
-        let flush_handle = flush_system.init();
+        let (cmd_tx, mut res_rx) = start_flush_workers::<M>(
+            path.to_path_buf(),
+            options.num_flush_jobs,
+            options.block_size,
+        );
+
+        let imm_memtables_clone: ImmutableMemtableMap<M> = imm_memtables.clone();
+        let l0_tables_clone = l0_tables.clone();
+        let sstables_clone = sstables.clone();
+        let manifest_clone = manifest.clone();
+
+        let state_update_handle = tokio::spawn(async move {
+            while let Some(result) = res_rx.recv().await {
+                let id = result.id;
+                let sst = result.sstable;
+                manifest_clone
+                    .lock()
+                    .await
+                    .add_record(ManifestRecord::Flush(id))
+                    .unwrap();
+
+                sstables_clone.write().await.insert(id, sst);
+
+                l0_tables_clone.write().await.push(id);
+
+                imm_memtables_clone.write().await.remove(&id);
+            }
+        });
 
         Ok(Self {
             swap_lock: Mutex::new(()),
@@ -178,51 +199,28 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             next_sst_id: Arc::new(AtomicUsize::new(next_sst_id)),
             options: Arc::new(options),
             manifest,
-            flush_handle: Arc::new(flush_handle),
+            state_update_handle,
+            flush_sender: cmd_tx,
         })
     }
 
     /// Graceful shutdown (waits until all data will be flushed).
     pub async fn close(self) -> Result<()> {
-        // Destructure self to take ownership of all fields
-        // Needed to solve partially moved problems
-        let LSMStorage {
-            path,
-            swap_lock: _,
-            memtable,
-            imm_memtables,
-            l0_tables: _,
-            sstables: _,
-            options,
-            next_sst_id: _,
-            manifest,
-            flush_handle,
-        } = self;
-
-        let flush_handle = Arc::try_unwrap(flush_handle).unwrap();
-        flush_handle.sender.send(FlushCommand::Shutdown).await?;
-        flush_handle.handle.await?;
-
-        let memtable = memtable.into_inner();
+        let memtable = self.memtable.into_inner();
         if memtable.size_estimate() > 0 {
             let id = memtable.get_id();
-            flush_memtable(options.block_size, &path, &memtable).await?;
-            manifest
+            flush_memtable(self.options.block_size, &self.path, &memtable).await?;
+            self.manifest
                 .lock()
                 .await
                 .add_record(ManifestRecord::Flush(id))?;
         }
 
-        let imm_memtables = Arc::try_unwrap(imm_memtables).unwrap().into_inner();
-        for memtable in imm_memtables.values() {
-            let id = memtable.get_id();
-            flush_memtable(options.block_size, &path, &**memtable).await?;
+        self.flush_sender.send(FlushCommand::Shutdown).await?;
 
-            manifest
-                .lock()
-                .await
-                .add_record(ManifestRecord::Flush(id))?;
-        }
+        drop(self.flush_sender);
+
+        self.state_update_handle.await?;
 
         Ok(())
     }
@@ -330,8 +328,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
 
         drop(memtable);
 
-        self.flush_handle
-            .sender
+        self.flush_sender
             .send(FlushCommand::Memtable(old_memtable))
             .await
             .context("Failed to send memtable into flush channel")?;
