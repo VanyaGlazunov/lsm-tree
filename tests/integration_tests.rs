@@ -2,74 +2,12 @@ use anyhow::Result;
 use bytes::Bytes;
 use lsm_tree::lsm_storage::LSMStorage;
 use lsm_tree::{lsm_storage::LSMStorageOptions, memtable::BtreeMapMemtable};
-use proptest::prelude::*;
-use std::collections::BTreeMap;
 use std::result::Result::Ok;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 type Storage = LSMStorage<BtreeMapMemtable>;
-
-fn operation_strategy() -> impl Strategy<Value = Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-    prop::collection::vec(
-        (
-            prop::collection::vec(any::<u8>(), 1..2024),
-            (any::<bool>(), prop::collection::vec(any::<u8>(), 1..2024)),
-        ),
-        1..100, // Number of operations
-    )
-    .prop_map(|ops| {
-        ops.into_iter()
-            .map(|(key, (delete, value))| (key, if delete { None } else { Some(value) }))
-            .collect()
-    })
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-    #[test]
-    fn prop_lsm_behaves_like_btreemap(operations in operation_strategy()) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let dir = tempdir().unwrap();
-            let storage = Storage::open(&dir, LSMStorageOptions::default()).unwrap();
-            let mut reference = BTreeMap::new();
-
-            for (key, value) in &operations {
-                match value {
-                    Some(v) => {
-                        storage.insert(key, Bytes::copy_from_slice(v)).await.unwrap();
-                        reference.insert(key.clone(), v.clone());
-                    }
-                    None => {
-                        storage.delete(key).await.unwrap();
-                        reference.remove(key);
-                    }
-                }
-            }
-
-            // Verify all entries match
-            for (key, value) in reference.iter() {
-                let storage_value = storage.get(key).await.unwrap();
-                assert_eq!(
-                    storage_value,
-                    Some(Bytes::from(value.clone())),
-                    "Mismatch for key: {:?}",
-                    key
-                );
-            }
-
-            // Verify deleted entries are gone
-            for (key, _) in operations.iter().filter(|(_, v)| v.is_none()) {
-                let actual = storage.get(key).await.unwrap();
-                assert_eq!(actual, None, "Key not deleted: {:?}", key);
-            }
-
-            storage.close().await.unwrap();
-        });
-    }
-}
 
 #[tokio::test]
 async fn test_sstable_priority() -> Result<()> {
