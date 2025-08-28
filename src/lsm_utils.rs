@@ -26,3 +26,7 @@ pub(crate) async fn flush_memtable(
 pub(crate) fn get_sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
     path.as_ref().to_path_buf().join(format!("{id}.sst"))
 }
+
+pub(crate) fn get_wal_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
+    path.as_ref().to_path_buf().join(format!("{id}.wal"))
+}

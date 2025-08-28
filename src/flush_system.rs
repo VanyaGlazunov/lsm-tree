@@ -5,6 +5,7 @@ use tokio::sync::{mpsc::Receiver, Semaphore};
 use crate::lsm_storage::FLUSH_CHANNEL_SIZE;
 use crate::{lsm_utils::flush_memtable, memtable::Memtable, sstable::SSTable};
 
+#[derive(Debug)]
 pub struct FlushResult {
     pub id: usize,
     pub sstable: SSTable,

@@ -5,3 +5,4 @@ pub mod lsm_utils;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;
+pub mod wal;
