@@ -3,7 +3,7 @@ pub(crate) mod builder;
 use std::{
     fs::{File, OpenOptions},
     os::unix::fs::FileExt,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::{block::Block, lsm_storage::Record};
@@ -24,7 +24,8 @@ pub struct BlockMeta {
 ///
 #[derive(Debug)]
 pub struct SSTable {
-    file: File,               // Underlying file
+    // file: File,               // Underlying file
+    path: PathBuf,
     meta: Vec<BlockMeta>,     // Blocks' meta data
     meta_block_offset: usize, // Offset of meta block in file
     bloom: Bloom<[u8]>,       // Bloom filter to speed up lookup
@@ -63,15 +64,20 @@ impl SSTable {
         self.last_key.clone()
     }
 
+    pub(crate) fn get_sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
+        path.as_ref().to_path_buf().join(format!("{id}.sst"))
+    }
+
     /// Opens existing SSTable
     ///
     /// #Errors
     /// - Returns error if can not open SSTable file
     /// - Returns error if can not decode SSTable file  
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
-            .open(path)
+            .open(&path)
             .context("Failed to open sstable file")?;
 
         let file_size = file.metadata()?.len() as usize;
@@ -112,7 +118,7 @@ impl SSTable {
             .clone();
 
         Ok(SSTable {
-            file,
+            path,
             meta,
             meta_block_offset: meta_offset,
             bloom,
@@ -161,8 +167,9 @@ impl SSTable {
         let block_len = end_offset - block_offset;
 
         let mut buf = vec![0; block_len];
-        self.file
-            .read_exact_at(&mut buf[..], block_offset as u64)
+        let file =
+            File::open(&self.path).context(format!("Failed to open SSTable {:?}", self.path))?;
+        file.read_exact_at(&mut buf[..], block_offset as u64)
             .context("Failed to read block data")?;
 
         Ok(Block::decode(&buf[..]))

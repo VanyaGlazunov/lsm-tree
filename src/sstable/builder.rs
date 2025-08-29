@@ -103,7 +103,7 @@ impl SSTableBuilder {
             .read(true)
             .create(true)
             .truncate(true)
-            .open(path)
+            .open(&path)
             .context("Failed to create file for SSTable")?;
 
         let meta_offset = self.data.len();
@@ -126,8 +126,10 @@ impl SSTableBuilder {
         file.write_all(&buf).context("Failed to write sstablw")?;
         file.sync_all().context("Failed to sync sstable file")?;
 
+        let path = path.as_ref().to_path_buf();
+
         Ok(SSTable {
-            file,
+            path,
             first_key: self.meta.first().unwrap().first_key.clone(),
             last_key: self.meta.last().unwrap().last_key.clone(),
             meta: self.meta,

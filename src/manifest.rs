@@ -5,13 +5,12 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::Path,
-    sync::{Arc, Mutex},
 };
 
 /// Append-only log for normal/crash recovery.
 pub(crate) struct Manifest {
     /// File handle of the log.
-    file: Arc<Mutex<File>>,
+    file: File,
 }
 
 /// Operations types logged in manifest.
@@ -25,14 +24,12 @@ impl Manifest {
     /// Creates new instance of manifest in the path given.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            file: Arc::new(Mutex::new(
-                OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(path)
-                    .context("Failed to create manifest file")?,
-            )),
+            file: OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)
+                .context("Failed to create manifest file")?,
         })
     }
 
@@ -64,16 +61,14 @@ impl Manifest {
             records.push(record);
         }
 
-        let manifest = Self {
-            file: Arc::new(Mutex::new(file)),
-        };
+        let manifest = Self { file };
 
         Ok((manifest, records))
     }
 
     /// Adds record and fsyncs
     pub fn add_record(&self, record: ManifestRecord) -> Result<()> {
-        let mut file = self.file.lock().unwrap();
+        let mut file = &self.file;
 
         let buf = encode_to_vec(record, standard())?;
 

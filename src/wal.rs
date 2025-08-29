@@ -3,7 +3,7 @@ use bytes::Bytes;
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::lsm_storage::Record;
@@ -138,6 +138,10 @@ impl Wal {
             out.push((entry.key, entry.value));
         }
         Ok(out)
+    }
+
+    pub(crate) fn get_wal_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
+        path.as_ref().to_path_buf().join(format!("{id}.wal"))
     }
 }
 

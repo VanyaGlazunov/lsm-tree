@@ -19,15 +19,13 @@ use tokio::{
 
 use crate::{
     flush_system::start_flush_workers,
-    lsm_utils::{flush_memtable, get_sst_path, get_wal_path},
     manifest::{Manifest, ManifestRecord},
     memtable::Memtable,
-    sstable::SSTable,
+    sstable::{builder::SSTableBuilder, SSTable},
     wal::Wal,
 };
 
 const TOMBSTONE: Record = Record::Delete;
-pub(crate) const FLUSH_CHANNEL_SIZE: usize = 100;
 const DEFAULT_BLOCK_SIZE: usize = 1 << 12;
 const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
 const DEFAULT_MEMTABLE_CAP: usize = 2;
@@ -36,7 +34,24 @@ const DEFAULT_DURABLE_WAL: bool = false;
 
 pub type ImmutableMemtableMap<M> = Arc<RwLock<BTreeMap<usize, Arc<M>>>>;
 pub type SSTableMap = Arc<RwLock<BTreeMap<usize, SSTable>>>;
-pub type L0TaablesList = Arc<RwLock<Vec<usize>>>;
+pub type L0TablesList = Arc<RwLock<Vec<usize>>>;
+
+/// Builds SSTable from memtable via SSTableBuilder.
+pub(crate) async fn flush_memtable(
+    block_size: usize,
+    path: impl AsRef<Path>,
+    memtable: &impl Memtable,
+) -> Result<SSTable> {
+    let mut builder = SSTableBuilder::new(block_size);
+    for (key, value) in memtable.iter() {
+        builder.add(key, value);
+    }
+
+    let id = memtable.get_id();
+    builder
+        .build(SSTable::get_sst_path(path, id))
+        .context(format!("Failed to flush memtable. id: {id}"))
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Record {
@@ -76,23 +91,8 @@ pub struct LSMStorageOptions {
     pub memtables_cap: usize,
     /// Number of async flush tasks
     pub num_flush_jobs: usize,
-}
-
-/// Main storage engine.
-pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
-    path: PathBuf,                          // Storage directory
-    swap_lock: Mutex<()>,                   // Memtable swap synchronization
-    memtable: RwLock<M>,                    // Active mutable memtable
-    imm_memtables: ImmutableMemtableMap<M>, // Frozen memtables by IDs
-    #[allow(dead_code)]
-    l0_tables: L0TaablesList, // SSTable IDs in L0
-    sstables: SSTableMap,                   // All SSTables by IDs
-    options: Arc<LSMStorageOptions>,        // Configuration
-    next_sst_id: Arc<AtomicUsize>,          // SSTable ID counter
-    manifest: Arc<Mutex<Manifest>>,         // Recovery log
-    state_update_handle: JoinHandle<()>,
-    flush_sender: Sender<Arc<M>>,
-    wal: Mutex<Wal>,
+    /// Sync after each append to the wal
+    pub durable_wal: bool,
 }
 
 impl Default for LSMStorageOptions {
@@ -102,8 +102,26 @@ impl Default for LSMStorageOptions {
             memtables_size: DEFAULT_MEMTABLE_SIZE,
             memtables_cap: DEFAULT_MEMTABLE_CAP,
             num_flush_jobs: DEFAULT_NUM_FLUSH_WORKERS,
+            durable_wal: DEFAULT_DURABLE_WAL,
         }
     }
+}
+
+/// Main storage engine.
+pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
+    path: PathBuf,                          // Storage directory
+    swap_lock: Mutex<()>,                   // Memtable swap synchronization
+    memtable: RwLock<M>,                    // Active mutable memtable
+    imm_memtables: ImmutableMemtableMap<M>, // Frozen memtables by IDs
+    #[allow(dead_code)]
+    l0_tables: L0TablesList, // SSTable IDs in L0
+    sstables: SSTableMap,                   // All SSTables by IDs
+    options: Arc<LSMStorageOptions>,        // Configuration
+    next_sst_id: Arc<AtomicUsize>,          // SSTable ID counter
+    manifest: Arc<Mutex<Manifest>>,         // Recovery log
+    state_update_handle: JoinHandle<()>,
+    flush_sender: Sender<Arc<M>>,
+    wal: Mutex<Wal>,
 }
 
 impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
@@ -141,7 +159,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         next_sst_id += 1;
 
         for id in &l0_tables {
-            let sstable_path = get_sst_path(path, *id);
+            let sstable_path = SSTable::get_sst_path(path, *id);
             let sstable = SSTable::open(&sstable_path)
                 .context(format!("Cannot open sst {sstable_path:?}"))?;
             sstables.insert(*id, sstable);
@@ -162,7 +180,6 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
                     continue;
                 }
 
-                println!("Recovering memtable {id} from WAL...");
                 let mut memtable = M::new(id);
                 let records = Wal::replay(&entry_path)?;
                 for (key, value) in records {
@@ -181,8 +198,8 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         manifest.add_record(ManifestRecord::NewMemtable(next_sst_id))?;
 
         let memtable = RwLock::new(M::new(next_sst_id));
-        let wal_path = get_wal_path(path, next_sst_id);
-        let wal = Mutex::new(Wal::open(&wal_path, DEFAULT_DURABLE_WAL)?);
+        let wal_path = Wal::get_wal_path(path, next_sst_id);
+        let wal = Mutex::new(Wal::open(&wal_path, options.durable_wal)?);
 
         let imm_memtables: ImmutableMemtableMap<M> = Arc::new(RwLock::new(imm_memtables_map));
         let l0_tables = Arc::new(RwLock::new(l0_tables));
@@ -221,7 +238,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
 
                 imm_memtables_clone.write().await.remove(&id);
 
-                let wal_path = get_wal_path(&path_buf, id);
+                let wal_path = Wal::get_wal_path(&path_buf, id);
                 if let Err(e) = remove_file(&wal_path) {
                     eprintln!("Failed to remove WAL file {wal_path:?}: {e}");
                 }
@@ -353,8 +370,8 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     async fn flush(&self, mut memtable: RwLockWriteGuard<'_, M>) -> Result<()> {
         let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let new_memtable = M::new(old_id + 1);
-        let new_wal_path = get_wal_path(&self.path, old_id + 1);
-        let new_wal = Wal::open(new_wal_path, DEFAULT_DURABLE_WAL)?;
+        let new_wal_path = Wal::get_wal_path(&self.path, old_id + 1);
+        let new_wal = Wal::open(new_wal_path, self.options.durable_wal)?;
 
         let old_memtable;
         {

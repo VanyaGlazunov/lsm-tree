@@ -1,8 +1,7 @@
-pub mod block;
-pub mod flush_system;
+mod block;
+mod flush_system;
 pub mod lsm_storage;
-pub mod lsm_utils;
-pub mod manifest;
+mod manifest;
 pub mod memtable;
-pub mod sstable;
-pub mod wal;
+mod sstable;
+mod wal;

@@ -2,8 +2,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use tokio::sync::{mpsc::Receiver, Semaphore};
 
-use crate::lsm_storage::FLUSH_CHANNEL_SIZE;
-use crate::{lsm_utils::flush_memtable, memtable::Memtable, sstable::SSTable};
+use crate::lsm_storage::flush_memtable;
+use crate::{memtable::Memtable, sstable::SSTable};
+
+const FLUSH_CHANNEL_SIZE: usize = 100;
 
 #[derive(Debug)]
 pub struct FlushResult {
