@@ -1,7 +1,8 @@
 use anyhow::Result;
 use bytes::Bytes;
 use lsm_tree::lsm_storage::LSMStorage;
-use lsm_tree::{lsm_storage::LSMStorageOptions, memtable::BtreeMapMemtable};
+use lsm_tree::memtable::BtreeMapMemtable;
+use lsm_tree::options::LSMStorageOptions;
 use std::result::Result::Ok;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -12,7 +13,7 @@ type Storage = LSMStorage<BtreeMapMemtable>;
 #[tokio::test]
 async fn test_sstable_priority() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
     let key = b"key";
 
     let old = Bytes::from("old");
@@ -20,11 +21,11 @@ async fn test_sstable_priority() -> Result<()> {
     storage.insert(key, old).await?;
     storage.close().await?;
 
-    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
     storage.insert(key, new.clone()).await?;
     storage.close().await?;
 
-    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
     let actual = storage.get(key).await?;
     assert_eq!(actual, Some(new));
     Ok(())
@@ -33,13 +34,16 @@ async fn test_sstable_priority() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_write_non_overlapping_keys() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Arc::new(Storage::open(
-        &dir,
-        LSMStorageOptions {
-            memtables_size: 100,
-            ..Default::default()
-        },
-    )?);
+    let storage = Arc::new(
+        Storage::open(
+            &dir,
+            LSMStorageOptions {
+                memtables_size: 100,
+                ..Default::default()
+            },
+        )
+        .await?,
+    );
 
     let num_tasks = num_cpus::get();
     let barrier = Arc::new(Barrier::new(num_tasks));
@@ -75,13 +79,16 @@ async fn test_concurrent_write_non_overlapping_keys() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_read_non_overlapping_keys() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Arc::new(Storage::open(
-        &dir,
-        LSMStorageOptions {
-            memtables_size: 100,
-            ..Default::default()
-        },
-    )?);
+    let storage = Arc::new(
+        Storage::open(
+            &dir,
+            LSMStorageOptions {
+                memtables_size: 100,
+                ..Default::default()
+            },
+        )
+        .await?,
+    );
 
     let num_tasks = num_cpus::get();
 
@@ -121,7 +128,7 @@ async fn test_concurrent_read_non_overlapping_keys() -> Result<()> {
 #[tokio::test]
 async fn test_large_value() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
 
     let expected = Bytes::from_owner(vec![1u8; 1 << 28]); // 256 mb
     let key = b"key";
@@ -130,7 +137,7 @@ async fn test_large_value() -> Result<()> {
     assert_eq!(actual, Some(expected.clone()));
 
     storage.close().await?;
-    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
     let actual = storage.get(&key).await?;
     assert_eq!(actual, Some(expected));
 
@@ -146,7 +153,8 @@ async fn test_repeat_same_key() -> Result<()> {
             memtables_size: 1,
             ..Default::default()
         },
-    )?;
+    )
+    .await?;
 
     let key = b"key";
     for i in 0..100 {
@@ -167,7 +175,8 @@ async fn test_repeat_same_key() -> Result<()> {
             memtables_size: 1,
             ..Default::default()
         },
-    )?;
+    )
+    .await?;
 
     storage.delete(&key).await?;
     let actual = storage.get(&key).await?;
@@ -185,7 +194,7 @@ async fn test_flush_race_conditions() -> Result<()> {
         ..Default::default()
     };
 
-    let storage = Storage::open(&dir, options)?;
+    let storage = Storage::open(&dir, options).await?;
 
     let expected = Bytes::from("value");
     for i in 0..100 {
@@ -203,7 +212,7 @@ async fn test_flush_race_conditions() -> Result<()> {
     storage.close().await?;
 
     // Verify persistence after forced flushes
-    let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
     for i in 0..100 {
         let key = format!("key-{}", i).into_bytes();
         let actual = storage.get(&key).await?;

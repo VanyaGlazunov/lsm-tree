@@ -1,12 +1,17 @@
 pub(crate) mod builder;
+pub(crate) mod merge_iterator;
 
 use std::{
     fs::{File, OpenOptions},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use crate::{block::Block, lsm_storage::Record};
+use crate::{
+    block::{builder::BlockEntry, Block},
+    lsm_storage::Record,
+};
 use anyhow::{Context, Result};
 use bloomfilter::Bloom;
 use bytes::{Buf, Bytes};
@@ -21,14 +26,12 @@ pub struct BlockMeta {
 }
 
 /// On-disk sorted key-value data.
-///
 #[derive(Debug)]
 pub struct SSTable {
-    // file: File,               // Underlying file
-    path: PathBuf,
+    path: PathBuf,            // underlying file
     meta: Vec<BlockMeta>,     // Blocks' meta data
     meta_block_offset: usize, // Offset of meta block in file
-    bloom: Bloom<[u8]>,       // Bloom filter to speed up lookup
+    bloom: Bloom<[u8]>,       // Bloom filter to speed up lookups
     first_key: Bytes,         // First key in SSTable
     last_key: Bytes,          // Last key in SSTable
 }
@@ -174,11 +177,74 @@ impl SSTable {
 
         Ok(Block::decode(&buf[..]))
     }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        SSTable::open(&self.path)
+    }
+}
+
+pub struct SSTableIterator {
+    sstable: Arc<SSTable>,
+    current_block: Option<Block>,
+    block_idx: usize,
+    entry_idx: usize,
+}
+
+impl SSTableIterator {
+    pub fn new(sstable: Arc<SSTable>) -> Result<Self> {
+        let first_block = if !sstable.meta.is_empty() {
+            Some(sstable.read_block(0)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            sstable,
+            current_block: first_block,
+            block_idx: 0,
+            entry_idx: 0,
+        })
+    }
+
+    fn entry_to_item(entry: &BlockEntry) -> (Bytes, Record) {
+        let key = Bytes::from(entry.key.clone());
+        let value = match &entry.value {
+            None => Record::Delete,
+            Some(val) => Record::Put(Bytes::from(val.clone())),
+        };
+        (key, value)
+    }
+}
+
+impl Iterator for SSTableIterator {
+    type Item = (Bytes, Record);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let block = self.current_block.as_ref()?;
+
+            if let Some(entry) = block.entries.get(self.entry_idx) {
+                self.entry_idx += 1;
+                return Some(Self::entry_to_item(entry));
+            }
+
+            self.block_idx += 1;
+            if self.block_idx >= self.sstable.meta.len() {
+                self.current_block = None;
+                return None;
+            }
+
+            self.current_block = self.sstable.read_block(self.block_idx).ok();
+            self.entry_idx = 0;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::lsm_storage::Record;
+    use std::sync::Arc;
+
+    use crate::{lsm_storage::Record, sstable::SSTableIterator};
 
     use super::{builder::SSTableBuilder, Bytes, Result, SSTable};
     use tempfile::NamedTempFile;
@@ -312,6 +378,59 @@ mod tests {
             sstable.get(b"persist")?,
             Some(Record::put_from_slice("data"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_iterator() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path();
+
+        let mut builder = SSTableBuilder::new(60);
+        builder.add(Bytes::from("a"), Record::put_from_slice("val_a"));
+        builder.add(Bytes::from("b"), Record::put_from_slice("val_b"));
+        builder.add(Bytes::from("c"), Record::put_from_slice("val_c"));
+        builder.add(Bytes::from("d"), Record::put_from_slice("val_d"));
+        builder.build(path)?;
+
+        let sstable = Arc::new(SSTable::open(path)?);
+        let mut iter = SSTableIterator::new(sstable)?;
+
+        assert_eq!(
+            iter.next(),
+            Some((Bytes::from("a"), Record::put_from_slice("val_a")))
+        );
+        assert_eq!(
+            iter.next(),
+            Some((Bytes::from("b"), Record::put_from_slice("val_b")))
+        );
+        assert_eq!(
+            iter.next(),
+            Some((Bytes::from("c"), Record::put_from_slice("val_c")))
+        );
+        assert_eq!(
+            iter.next(),
+            Some((Bytes::from("d"), Record::put_from_slice("val_d")))
+        );
+        assert_eq!(iter.next(), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_iterator_empty() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path();
+
+        let mut builder = SSTableBuilder::new(1024);
+        builder.add(Bytes::from("key"), Record::put_from_slice("value"));
+        builder.build(path)?;
+
+        let sstable = Arc::new(SSTable::open(path)?);
+        let mut iter = SSTableIterator::new(sstable)?;
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
         Ok(())
     }
 }

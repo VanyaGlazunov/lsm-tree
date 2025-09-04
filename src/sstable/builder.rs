@@ -35,7 +35,7 @@ impl SSTableBuilder {
         }
     }
 
-    /// Adda entry to future SSTable.
+    /// Adds entry to future SSTable.
     pub fn add(&mut self, key: Bytes, value: Record) {
         if self.current_first_key.is_empty() {
             self.current_first_key = key.clone();
@@ -54,7 +54,7 @@ impl SSTableBuilder {
         self.current_last_key = key;
     }
 
-    // builds current block and adds it to future SSTable.
+    // Builds current block and adds it to future SSTable.
     fn finish_block(&mut self) {
         if self.block_builder.is_empty() {
             return;

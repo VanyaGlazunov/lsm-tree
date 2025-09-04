@@ -8,8 +8,45 @@ use std::{
 
 use crate::lsm_storage::Record;
 
-const TAG_PUT: u8 = 0;
-const TAG_DELETE: u8 = 1;
+enum EntryTag {
+    Put,
+    Delete,
+    Invalid,
+}
+
+impl From<u8> for EntryTag {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => EntryTag::Put,
+            1 => EntryTag::Delete,
+            _ => EntryTag::Invalid,
+        }
+    }
+}
+
+struct WalReader<R> {
+    reader: R,
+}
+
+impl<R: Read> WalReader<R> {
+    fn read_u8(&mut self) -> io::Result<u8> {
+        let mut buf = [0u8; 1];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn read_u64(&mut self) -> io::Result<u64> {
+        let mut buf = [0u8; 8];
+        self.reader.read_exact(&mut buf)?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    fn read_bytes(&mut self, len: usize) -> io::Result<Bytes> {
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact(&mut buf)?;
+        Ok(Bytes::from(buf))
+    }
+}
 
 #[derive(Debug)]
 struct WalEntry {
@@ -21,14 +58,14 @@ impl WalEntry {
     fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
         match &self.value {
             Record::Put(v) => {
-                buf.push(TAG_PUT);
+                buf.push(EntryTag::Put as u8);
                 buf.write_all(&(self.key.len() as u64).to_le_bytes())?;
                 buf.write_all(&(v.len() as u64).to_le_bytes())?;
                 buf.write_all(&self.key)?;
                 buf.write_all(v)?;
             }
             Record::Delete => {
-                buf.push(TAG_DELETE);
+                buf.push(EntryTag::Delete as u8);
                 buf.write_all(&(self.key.len() as u64).to_le_bytes())?;
                 buf.write_all(&(0u64).to_le_bytes())?;
                 buf.write_all(&self.key)?;
@@ -37,29 +74,20 @@ impl WalEntry {
         Ok(())
     }
 
-    fn decode(mut reader: impl Read) -> Result<Self> {
-        let mut u8_buf = [0u8; 1];
-        reader.read_exact(&mut u8_buf)?;
-        let tag = u8_buf[0];
+    fn decode(reader: impl Read) -> Result<Self> {
+        let mut wal_reader = WalReader { reader };
 
-        let mut u64_buf = [0u8; 8];
+        let tag = wal_reader.read_u8()?;
 
-        reader.read_exact(&mut u64_buf)?;
-        let key_len = u64::from_le_bytes(u64_buf) as usize;
+        let key_len = wal_reader.read_u64()? as usize;
+        let val_len = wal_reader.read_u64()? as usize;
 
-        reader.read_exact(&mut u64_buf)?;
-        let val_len = u64::from_le_bytes(u64_buf) as usize;
+        let key = wal_reader.read_bytes(key_len)?;
 
-        let mut key_buf = vec![0u8; key_len];
-        reader.read_exact(&mut key_buf)?;
-        let key = Bytes::from(key_buf);
-
-        let value = if tag == TAG_PUT {
-            let mut val_buf = vec![0u8; val_len];
-            reader.read_exact(&mut val_buf)?;
-            Record::Put(Bytes::from(val_buf))
-        } else {
-            Record::Delete
+        let value = match tag.into() {
+            EntryTag::Put => Record::Put(wal_reader.read_bytes(val_len)?),
+            EntryTag::Delete => Record::Delete,
+            EntryTag::Invalid => anyhow::bail!("Wrong tag for wal entry"),
         };
 
         Ok(Self { key, value })
@@ -77,8 +105,9 @@ impl Wal {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(&path)
-            .context("Failed to open WAL file")?;
+            .context(format!("Failed to open WAL file {:?}", &path))?;
 
         Ok(Self { file, durable })
     }
@@ -103,41 +132,11 @@ impl Wal {
         Ok(())
     }
 
-    pub fn replay(path: impl AsRef<Path>) -> Result<Vec<(Bytes, Record)>> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(path.as_ref())
-            .context("Failed to open WAL for replay")?;
-
-        let mut out = Vec::new();
-        loop {
-            let mut len_buf = [0u8; 8];
-            match file.read_exact(&mut len_buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    break;
-                }
-                Err(e) => return Err(e).context("Failed to read WAL entry length"),
-            };
-
-            let total_len = u64::from_le_bytes(len_buf);
-
-            let entry_reader = std::io::Read::by_ref(&mut file).take(total_len);
-            let entry = match WalEntry::decode(entry_reader) {
-                Ok(entry) => entry,
-                Err(e) => {
-                    if e.downcast_ref::<io::Error>()
-                        .is_some_and(|io_err| io_err.kind() == io::ErrorKind::UnexpectedEof)
-                    {
-                        eprintln!("WAL is corrupted at the end, stopping replay.");
-                        break;
-                    }
-                    return Err(e).context("Failed to decode WAL entry");
-                }
-            };
-            out.push((entry.key, entry.value));
+    pub fn iter(self) -> WalIterator {
+        WalIterator {
+            wal: self,
+            stop: false,
         }
-        Ok(out)
     }
 
     pub(crate) fn get_wal_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -145,10 +144,57 @@ impl Wal {
     }
 }
 
+pub struct WalIterator {
+    wal: Wal,
+    stop: bool,
+}
+
+impl Iterator for WalIterator {
+    type Item = Result<(Bytes, Record)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.stop {
+            return None;
+        }
+
+        let mut reader = &self.wal.file;
+        let mut len_buf = [0u8; 8];
+        match reader.read_exact(&mut len_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => {
+                self.stop = true;
+                return Some(Err(e).context("Failed to read entry length"));
+            }
+        }
+        let total_len = u64::from_le_bytes(len_buf);
+        let mut entry_buf = vec![0u8; total_len as usize];
+        match reader.read_exact(&mut entry_buf) {
+            Ok(_) => {}
+            Err(e) => return Some(Err(e).context("Failed to read entry data")),
+        }
+
+        let mut entry_reader = &entry_buf[..];
+        match WalEntry::decode(&mut entry_reader) {
+            Ok(entry) => Some(Ok((entry.key, entry.value))),
+            Err(e)
+                if e.downcast_ref::<io::Error>()
+                    .map(|io_err| io_err.kind() == io::ErrorKind::UnexpectedEof)
+                    .unwrap_or(false) =>
+            {
+                // Partial entry at the end, ignore it
+                eprintln!("WAL is corrupted at the end, stopping replay.");
+                None
+            }
+            Err(e) => Some(Err(e).context("Failed to decode WAL entry")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
+    use anyhow::{Ok, Result};
     use bytes::Bytes;
     use std::fs::OpenOptions;
     use tempfile::tempdir;
@@ -159,16 +205,17 @@ mod tests {
     fn test_wal_append_and_replay_put() -> Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("test_put.wal");
+        let durable = true;
 
         {
-            let mut wal = Wal::open(&path, true)?;
+            let mut wal = Wal::open(&path, durable)?;
             wal.append(Bytes::from("k1"), &Record::put_from_slice("v1"))?;
             wal.append(Bytes::from("k2"), &Record::put_from_slice("v2"))?;
         }
 
-        let entries = Wal::replay(&path)?;
+        let entries: Result<Vec<_>, _> = Wal::open(&path, false)?.iter().collect();
         assert_eq!(
-            entries,
+            entries?,
             vec![
                 (Bytes::from("k1"), Record::put_from_slice("v1")),
                 (Bytes::from("k2"), Record::put_from_slice("v2")),
@@ -188,8 +235,8 @@ mod tests {
             wal.append(Bytes::from("key"), &Record::Delete)?;
         }
 
-        let entries = Wal::replay(&path)?;
-        assert_eq!(entries, vec![(Bytes::from("key"), Record::Delete)]);
+        let entries: Result<Vec<_>, _> = Wal::open(&path, false)?.iter().collect();
+        assert_eq!(entries?, vec![(Bytes::from("key"), Record::Delete)]);
         Ok(())
     }
 
@@ -214,7 +261,10 @@ mod tests {
             f.set_len(truncate_to)?;
         }
 
-        let entries = Wal::replay(&path)?;
+        let entries: Vec<_> = Wal::open(&path, false)?
+            .iter()
+            .filter_map(Result::ok)
+            .collect();
         assert!(!entries.is_empty());
         assert_eq!(entries[0], (Bytes::from("a"), Record::put_from_slice("1")));
 

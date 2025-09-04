@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{create_dir_all, remove_file},
     mem::replace,
     path::{Path, PathBuf},
@@ -13,28 +13,24 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{mpsc::Sender, Mutex, RwLock, RwLockWriteGuard},
+    sync::{mpsc::{Receiver, Sender}, Mutex, RwLock, RwLockWriteGuard},
     task::JoinHandle,
 };
 
 use crate::{
-    flush_system::start_flush_workers,
+    flush_system::{start_flush_workers, FlushResult},
     manifest::{Manifest, ManifestRecord},
     memtable::Memtable,
+    options::LSMStorageOptions,
     sstable::{builder::SSTableBuilder, SSTable},
     wal::Wal,
 };
 
 const TOMBSTONE: Record = Record::Delete;
-const DEFAULT_BLOCK_SIZE: usize = 1 << 12;
-const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
-const DEFAULT_MEMTABLE_CAP: usize = 2;
-const DEFAULT_NUM_FLUSH_WORKERS: usize = 2;
-const DEFAULT_DURABLE_WAL: bool = false;
 
-pub type ImmutableMemtableMap<M> = Arc<RwLock<BTreeMap<usize, Arc<M>>>>;
-pub type SSTableMap = Arc<RwLock<BTreeMap<usize, SSTable>>>;
-pub type L0TablesList = Arc<RwLock<Vec<usize>>>;
+pub(crate) type ImmutableMemtableMap<M> = BTreeMap<usize, Arc<M>>;
+pub(crate) type SSTableMap = BTreeMap<usize, SSTable>;
+pub(crate) type Levels = Vec<Vec<usize>>;
 
 /// Builds SSTable from memtable via SSTableBuilder.
 pub(crate) async fn flush_memtable(
@@ -79,46 +75,30 @@ impl Record {
     }
 }
 
-/// Configuration for [LSMStorage]
-#[derive(Clone)]
-pub struct LSMStorageOptions {
-    /// Size of a block in SSTable.
-    pub block_size: usize,
-    /// Size of memtables
-    pub memtables_size: usize,
-    // Number of immutable memtables stored in memory.
-    #[allow(unused)]
-    pub memtables_cap: usize,
-    /// Number of async flush tasks
-    pub num_flush_jobs: usize,
-    /// Sync after each append to the wal
-    pub durable_wal: bool,
+/// Consists of data that is needed during flush, compaction.
+pub(crate) struct State<M: Memtable + Send + Sync + 'static> {
+    pub path: PathBuf,                                  // Storage directory
+    pub imm_memtables: RwLock<ImmutableMemtableMap<M>>, // Frozen memtables by IDs
+    pub levels: RwLock<Levels>,                         // Compaction levels for ssts
+    pub sstables: RwLock<SSTableMap>,                   // All SSTables by IDs
+    pub next_sst_id: AtomicUsize,                       // SSTable ID counter
+    pub manifest: Mutex<Manifest>,                      // Recovery log
+    pub options: LSMStorageOptions,                     // Configuration
 }
 
-impl Default for LSMStorageOptions {
-    fn default() -> Self {
-        Self {
-            block_size: DEFAULT_BLOCK_SIZE,
-            memtables_size: DEFAULT_MEMTABLE_SIZE,
-            memtables_cap: DEFAULT_MEMTABLE_CAP,
-            num_flush_jobs: DEFAULT_NUM_FLUSH_WORKERS,
-            durable_wal: DEFAULT_DURABLE_WAL,
-        }
-    }
+struct RecoveryState<M> {
+    levels: Levels,
+    sstables: SSTableMap,
+    sst_to_level: BTreeMap<usize, usize>,
+    imm_memtables: ImmutableMemtableMap<M>,
+    next_sst_id: usize,
 }
 
 /// Main storage engine.
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
-    path: PathBuf,                          // Storage directory
-    swap_lock: Mutex<()>,                   // Memtable swap synchronization
-    memtable: RwLock<M>,                    // Active mutable memtable
-    imm_memtables: ImmutableMemtableMap<M>, // Frozen memtables by IDs
-    #[allow(dead_code)]
-    l0_tables: L0TablesList, // SSTable IDs in L0
-    sstables: SSTableMap,                   // All SSTables by IDs
-    options: Arc<LSMStorageOptions>,        // Configuration
-    next_sst_id: Arc<AtomicUsize>,          // SSTable ID counter
-    manifest: Arc<Mutex<Manifest>>,         // Recovery log
+    swap_lock: Mutex<()>, // Memtable swap synchronization
+    memtable: RwLock<M>,  // Active mutable memtable
+    state: Arc<State<M>>,
     state_update_handle: JoinHandle<()>,
     flush_sender: Sender<Arc<M>>,
     wal: Mutex<Wal>,
@@ -126,16 +106,9 @@ pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
 
 impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     /// Opens/Creates storage in path given.
-    pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
+    pub async fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
-        let mut l0_tables = Vec::<usize>::new();
-        let mut sstables = BTreeMap::<usize, SSTable>::new();
-
-        let mut next_sst_id = 0_usize;
-
-        if !path.exists() {
-            create_dir_all(path).context("Failed to create DB directory")?;
-        }
+        create_dir_all(path).context("Failed to create DB directory")?;
 
         let manifest_path = path.join("MANIFEST");
         let (manifest, records) = if manifest_path.exists() {
@@ -143,45 +116,164 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         } else {
             (Manifest::new(manifest_path)?, Vec::new())
         };
+        let mut recovery_state = Self::recover_state_from_manifest(records)?;
+
+        Self::load_sstables(path, &mut recovery_state)?;
+
+        let memtables_to_flush = Self::recover_memtables_from_wal(path, &mut recovery_state)?;
+
+        let (cmd_tx, res_rx) = start_flush_workers::<M>(
+            path.to_path_buf(),
+            options.num_flush_jobs,
+            options.block_size,
+        );
+        for mem_id in memtables_to_flush {
+            if let Some(mem) = recovery_state.imm_memtables.get(&mem_id) {
+                cmd_tx.send(mem.clone()).await?;
+            }
+        }
+
+        let next_sst_id = recovery_state.next_sst_id;
+        manifest.add_record(ManifestRecord::NewMemtable(next_sst_id))?;
+
+        let memtable = RwLock::new(M::new(next_sst_id));
+        let wal_path = Wal::get_wal_path(path, next_sst_id);
+        let wal = Mutex::new(Wal::open(&wal_path, options.durable_wal)?);
+
+        let state = Arc::new(State::<M> {
+            path: path.to_path_buf(),
+            imm_memtables: RwLock::new(recovery_state.imm_memtables),
+            levels: RwLock::new(recovery_state.levels),
+            sstables: RwLock::new(recovery_state.sstables),
+            next_sst_id: AtomicUsize::new(next_sst_id),
+            manifest: Mutex::new(manifest),
+            options,
+        });
+
+        let state_update_handle = Self::init_state_update(state.clone(), res_rx);
+
+        Ok(Self {
+            swap_lock: Mutex::new(()),
+            memtable,
+            state,
+            state_update_handle,
+            flush_sender: cmd_tx,
+            wal,
+        })
+    }
+
+    fn init_state_update(state: Arc<State<M>>, mut flush_receiver: Receiver<FlushResult>) -> JoinHandle<()> {
+        tokio::spawn({
+            async move {
+                while let Some(result) = flush_receiver.recv().await {
+                    let id = result.id;
+                    let sst = result.sstable;
+                    state
+                        .manifest
+                        .lock()
+                        .await
+                        .add_record(ManifestRecord::Flush(id))
+                        .unwrap();
+
+                    state.sstables.write().await.insert(id, sst);
+
+                    state.levels.write().await[0].push(id);
+
+                    state.imm_memtables.write().await.remove(&id);
+
+                    let wal_path = Wal::get_wal_path(&state.path, id);
+                    if let Err(e) = remove_file(&wal_path) {
+                        eprintln!("Failed to remove WAL file {wal_path:?}: {e}");
+                    }
+                }
+            }
+        })
+    }
+
+    fn recover_state_from_manifest(records: Vec<ManifestRecord>) -> Result<RecoveryState<M>> {
+        let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
+        let mut sst_to_level = BTreeMap::<usize, usize>::new();
+        let mut next_sst_id = 0_usize;
 
         for record in records {
             match record {
                 ManifestRecord::Flush(id) => {
+                    levels[0].push(id);
+                    sst_to_level.insert(id, 0);
                     next_sst_id = next_sst_id.max(id);
                 }
                 ManifestRecord::NewMemtable(id) => {
-                    l0_tables.push(id);
                     next_sst_id = next_sst_id.max(id);
+                }
+                ManifestRecord::Compaction {
+                    level,
+                    add_stts,
+                    remove_stts,
+                } => {
+                    for sst_id in &remove_stts {
+                        if let Some(from_level) = sst_to_level.remove(sst_id) {
+                            if let Some(from_level_entries) = levels.get_mut(from_level) {
+                                from_level_entries.remove(*sst_id);
+                            }
+                        }
+                    }
+
+                    while levels.len() <= level {
+                        levels.push(Vec::new());
+                    }
+
+                    for sst_id in &add_stts {
+                        levels[level].push(*sst_id);
+                        sst_to_level.insert(*sst_id, level);
+                        next_sst_id = next_sst_id.max(*sst_id);
+                    }
                 }
             }
         }
 
-        next_sst_id += 1;
+        Ok(RecoveryState {
+            levels,
+            sstables: BTreeMap::new(),
+            imm_memtables: ImmutableMemtableMap::new(),
+            sst_to_level,
+            next_sst_id: next_sst_id + 1,
+        })
+    }
 
-        for id in &l0_tables {
-            let sstable_path = SSTable::get_sst_path(path, *id);
-            let sstable = SSTable::open(&sstable_path)
-                .context(format!("Cannot open sst {sstable_path:?}"))?;
-            sstables.insert(*id, sstable);
+    fn load_sstables(path: &Path, recovery_state: &mut RecoveryState<M>) -> Result<()> {
+        for level in &recovery_state.levels {
+            for id in level {
+                let sstable_path = SSTable::get_sst_path(path, *id);
+                let sstable = SSTable::open(&sstable_path)
+                    .context(format!("Cannot open sst {sstable_path:?}"))?;
+                recovery_state.sstables.insert(*id, sstable);
+            }
         }
+        Ok(())
+    }
 
+    fn recover_memtables_from_wal(
+        path: &Path,
+        recovery_state: &mut RecoveryState<M>,
+    ) -> Result<Vec<usize>> {
         let mut imm_memtables_map = BTreeMap::<usize, Arc<M>>::new();
         let mut memtables_to_flush = Vec::new();
+        let all_sst_ids: HashSet<usize> = recovery_state.sst_to_level.keys().cloned().collect();
 
         for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
+            let entry_path = entry?.path();
             if entry_path.extension().is_some_and(|e| e == "wal") {
                 let id_str = entry_path.file_stem().unwrap().to_str().unwrap();
                 let id = id_str.parse::<usize>()?;
 
-                if l0_tables.contains(&id) {
+                if all_sst_ids.contains(&id) {
                     remove_file(entry_path)?;
                     continue;
                 }
 
                 let mut memtable = M::new(id);
-                let records = Wal::replay(&entry_path)?;
+                let records: Result<Vec<_>, _> = Wal::open(entry_path, false)?.iter().collect();
+                let records = records?;
                 for (key, value) in records {
                     memtable.set(key, value);
                 }
@@ -189,76 +281,15 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
                 if memtable.size_estimate() > 0 {
                     let memtable_arc = Arc::new(memtable);
                     imm_memtables_map.insert(id, memtable_arc.clone());
-                    memtables_to_flush.push(memtable_arc);
+                    memtables_to_flush.push(id);
                 }
-                next_sst_id = next_sst_id.max(id + 1);
+                recovery_state.next_sst_id = recovery_state.next_sst_id.max(id + 1);
             }
         }
 
-        manifest.add_record(ManifestRecord::NewMemtable(next_sst_id))?;
+        recovery_state.imm_memtables = imm_memtables_map;
 
-        let memtable = RwLock::new(M::new(next_sst_id));
-        let wal_path = Wal::get_wal_path(path, next_sst_id);
-        let wal = Mutex::new(Wal::open(&wal_path, options.durable_wal)?);
-
-        let imm_memtables: ImmutableMemtableMap<M> = Arc::new(RwLock::new(imm_memtables_map));
-        let l0_tables = Arc::new(RwLock::new(l0_tables));
-        let sstables = Arc::new(RwLock::new(sstables));
-        let manifest = Arc::new(Mutex::new(manifest));
-
-        let (cmd_tx, mut res_rx) = start_flush_workers::<M>(
-            path.to_path_buf(),
-            options.num_flush_jobs,
-            options.block_size,
-        );
-
-        for mem in memtables_to_flush {
-            cmd_tx.blocking_send(mem)?;
-        }
-
-        let imm_memtables_clone: ImmutableMemtableMap<M> = imm_memtables.clone();
-        let l0_tables_clone = l0_tables.clone();
-        let sstables_clone = sstables.clone();
-        let manifest_clone = manifest.clone();
-        let path_buf = path.to_path_buf();
-
-        let state_update_handle = tokio::spawn(async move {
-            while let Some(result) = res_rx.recv().await {
-                let id = result.id;
-                let sst = result.sstable;
-                manifest_clone
-                    .lock()
-                    .await
-                    .add_record(ManifestRecord::Flush(id))
-                    .unwrap();
-
-                sstables_clone.write().await.insert(id, sst);
-
-                l0_tables_clone.write().await.push(id);
-
-                imm_memtables_clone.write().await.remove(&id);
-
-                let wal_path = Wal::get_wal_path(&path_buf, id);
-                if let Err(e) = remove_file(&wal_path) {
-                    eprintln!("Failed to remove WAL file {wal_path:?}: {e}");
-                }
-            }
-        });
-
-        Ok(Self {
-            swap_lock: Mutex::new(()),
-            memtable,
-            imm_memtables,
-            l0_tables,
-            sstables,
-            path: path.to_path_buf(),
-            next_sst_id: Arc::new(AtomicUsize::new(next_sst_id)),
-            options: Arc::new(options),
-            manifest,
-            state_update_handle,
-            flush_sender: cmd_tx,
-            wal,
-        })
+        Ok(memtables_to_flush)
     }
 
     /// Graceful shutdown (waits until all data will be flushed).
@@ -266,8 +297,9 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let memtable = self.memtable.into_inner();
         if memtable.size_estimate() > 0 {
             let id = memtable.get_id();
-            flush_memtable(self.options.block_size, &self.path, &memtable).await?;
-            self.manifest
+            flush_memtable(self.state.options.block_size, &self.state.path, &memtable).await?;
+            self.state
+                .manifest
                 .lock()
                 .await
                 .add_record(ManifestRecord::Flush(id))?;
@@ -293,39 +325,47 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let memtable = self.memtable.read().await;
         let key = key.as_ref();
 
-        let mut candidate = memtable.get(key);
-        if let Some(rec) = candidate {
-            return Ok(rec.into_inner());
-        }
-
-        let imm_memtables = self.imm_memtables.read().await;
-        for memtable in imm_memtables.values() {
-            let value = memtable.get(key);
-            if value.is_some() {
-                candidate = value;
-            }
-        }
-
-        if let Some(rec) = candidate {
+        if let Some(rec) = memtable.get(key) {
             return Ok(rec.into_inner());
         }
 
         drop(memtable);
-        drop(imm_memtables);
 
-        let sstables = self.sstables.read().await;
-        for sst in sstables.values() {
-            let value = sst.get(key)?;
-            if value.is_some() {
-                candidate = value;
+        let imm_memtables = self.state.imm_memtables.read().await;
+        for imm_memtable in imm_memtables.values().rev() {
+            if let Some(rec) = imm_memtable.get(key) {
+                return Ok(rec.into_inner());
             }
         }
 
-        if let Some(rec) = candidate {
-            return Ok(rec.into_inner());
+        drop(imm_memtables);
+
+        let levels = self.state.levels.read().await;
+        let sstables = self.state.sstables.read().await;
+
+        if let Some(level0) = levels.first() {
+            for sst_id in level0.iter().rev() {
+                if let Some(sst) = sstables.get(sst_id) {
+                    if let Some(rec) = sst.get(key)? {
+                        return Ok(rec.into_inner());
+                    }
+                }
+            }
         }
 
-        drop(sstables);
+        for level in levels.iter().skip(1) {
+            for sst_id in level {
+                if let Some(sst) = sstables.get(sst_id) {
+                    if key >= sst.first_key().as_ref() && key <= sst.last_key().as_ref() {
+                        if let Some(rec) = sst.get(key)? {
+                            return Ok(rec.into_inner());
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(None)
     }
@@ -352,7 +392,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         let mut memtable = self.memtable.write().await;
         memtable.set(key, value.clone());
 
-        if memtable.size_estimate() > self.options.memtables_size {
+        if memtable.size_estimate() > self.state.options.memtables_size {
             self.flush(memtable)
                 .await
                 .context("Failed to start flushing")?;
@@ -368,10 +408,12 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     }
 
     async fn flush(&self, mut memtable: RwLockWriteGuard<'_, M>) -> Result<()> {
-        let old_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-        let new_memtable = M::new(old_id + 1);
-        let new_wal_path = Wal::get_wal_path(&self.path, old_id + 1);
-        let new_wal = Wal::open(new_wal_path, self.options.durable_wal)?;
+        let old_id = self.state.next_sst_id.fetch_add(1, Ordering::SeqCst);
+
+        let new_id = old_id + 1;
+        let new_memtable = M::new(new_id);
+        let new_wal_path = Wal::get_wal_path(&self.state.path, new_id);
+        let new_wal = Wal::open(new_wal_path, self.state.options.durable_wal)?;
 
         let old_memtable;
         {
@@ -382,13 +424,15 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         };
         let old_memtable = Arc::new(old_memtable);
 
-        self.manifest
+        self.state
+            .manifest
             .lock()
             .await
             .add_record(ManifestRecord::NewMemtable(old_id))
             .context("Failed to add NewMemtable record to manifest")?;
 
-        self.imm_memtables
+        self.state
+            .imm_memtables
             .write()
             .await
             .insert(old_id, old_memtable.clone());
@@ -417,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_crud() -> Result<()> {
         let dir = tempdir()?;
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
 
         let expected = Bytes::from("val1");
         let key = b"key";
@@ -438,13 +482,13 @@ mod tests {
     async fn test_persistence() -> Result<()> {
         let dir = tempdir()?;
 
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
         let key = b"key";
         let expected = Bytes::from("data");
         storage.insert(&key, expected.clone()).await?;
         storage.close().await?;
 
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
         let actual = storage.get(&key).await?;
         assert_eq!(actual, Some(expected));
         Ok(())
@@ -459,15 +503,15 @@ mod tests {
                 memtables_size: 1,
                 ..Default::default()
             },
-        )?;
+        )
+        .await?;
 
         let key = b"key";
         let expected = Bytes::from("data");
         storage.insert(key.clone(), expected.clone()).await?;
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait for flush
         storage.close().await?;
-
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
         let actual = storage.get(key).await?;
         assert_eq!(actual, Some(expected));
         Ok(())

@@ -18,6 +18,12 @@ pub(crate) struct Manifest {
 pub(crate) enum ManifestRecord {
     NewMemtable(usize), // Creation of memtable with given ID
     Flush(usize),       // Flush of a memtable with given ID
+    Compaction {
+        // Compaction result: new files `add_ssts` are added to `level`, old files `remove_ssts` are removed.
+        level: usize,
+        add_stts: Vec<usize>,
+        remove_stts: Vec<usize>,
+    },
 }
 
 impl Manifest {
