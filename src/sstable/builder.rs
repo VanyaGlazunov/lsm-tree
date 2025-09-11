@@ -1,8 +1,9 @@
-use std::{fs::OpenOptions, io::Write, path::Path};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use bloomfilter::Bloom;
 use bytes::{BufMut, Bytes};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{block::builder::BlockBuilder, lsm_storage::Record};
 
@@ -90,8 +91,8 @@ impl SSTableBuilder {
         buf
     }
 
-    /// Finilizes SSTable and writes on disk all serialized data (also fsyncs).
-    pub fn build(mut self, path: impl AsRef<Path>) -> Result<SSTable> {
+    /// Finilizes SSTable and writes on disk all serialized data.
+    pub async fn build(mut self, path: impl AsRef<Path>) -> Result<SSTable> {
         if self.current_first_key.is_empty() {
             anyhow::bail!("Empty SSTables are not allowed");
         }
@@ -104,6 +105,7 @@ impl SSTableBuilder {
             .create(true)
             .truncate(true)
             .open(&path)
+            .await
             .context("Failed to create file for SSTable")?;
 
         let meta_offset = self.data.len();
@@ -114,7 +116,6 @@ impl SSTableBuilder {
 
         let bloom_offset = buf.len();
 
-        // TODO:
         let mut bloom = Bloom::new_for_fp_rate(self.keys.len(), FP_RATE).unwrap();
         self.keys.into_iter().for_each(|key| bloom.set(&*key));
 
@@ -123,13 +124,13 @@ impl SSTableBuilder {
         buf.put_u32((bloom_offset - meta_offset) as u32);
         buf.put_u32(meta_offset as u32);
 
-        file.write_all(&buf).context("Failed to write sstablw")?;
-        file.sync_all().context("Failed to sync sstable file")?;
-
-        let path = path.as_ref().to_path_buf();
+        file.write_all(&buf).await?;
+        file.sync_all()
+            .await
+            .context("Failed to sync sstable file")?;
 
         Ok(SSTable {
-            path,
+            path: path.as_ref().to_path_buf(),
             first_key: self.meta.first().unwrap().first_key.clone(),
             last_key: self.meta.last().unwrap().last_key.clone(),
             meta: self.meta,

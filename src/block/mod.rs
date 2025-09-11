@@ -23,7 +23,7 @@ fn bincode_config() -> impl Config {
 
 impl Block {
     /// Creates an iterator over the block's entries
-    pub fn iter(&self) -> BlockIterator {
+    pub fn iter(&'_ self) -> BlockIterator<'_> {
         BlockIterator {
             entries: &self.entries,
             current_idx: 0,

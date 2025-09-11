@@ -191,19 +191,19 @@ pub struct SSTableIterator {
 }
 
 impl SSTableIterator {
-    pub fn new(sstable: Arc<SSTable>) -> Result<Self> {
+    pub fn new(sstable: Arc<SSTable>) -> Self {
         let first_block = if !sstable.meta.is_empty() {
-            Some(sstable.read_block(0)?)
+            sstable.read_block(0).ok()
         } else {
             None
         };
 
-        Ok(Self {
+        Self {
             sstable,
             current_block: first_block,
             block_idx: 0,
             entry_idx: 0,
-        })
+        }
     }
 
     fn entry_to_item(entry: &BlockEntry) -> (Bytes, Record) {
@@ -249,15 +249,15 @@ mod tests {
     use super::{builder::SSTableBuilder, Bytes, Result, SSTable};
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_single_entry() -> Result<()> {
+    #[tokio::test]
+    async fn test_single_entry() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
 
         {
             let mut builder = SSTableBuilder::new(1024);
             builder.add(Bytes::from("key1"), Record::put_from_slice("value1"));
-            builder.build(path)?;
+            builder.build(path).await?;
         }
 
         let sstable = SSTable::open(path)?;
@@ -270,8 +270,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_multiple_blocks() -> Result<()> {
+    #[tokio::test]
+    async fn test_multiple_blocks() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
 
@@ -284,7 +284,7 @@ mod tests {
                     Record::put_from_slice(format!("value{}", key)),
                 );
             }
-            builder.build(path)?;
+            builder.build(path).await?;
         }
 
         let sstable = SSTable::open(path)?;
@@ -301,15 +301,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_nonexistent_key() -> Result<()> {
+    #[tokio::test]
+    async fn test_nonexistent_key() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
 
         {
             let mut builder = SSTableBuilder::new(1024);
             builder.add(Bytes::from("b"), Record::put_from_slice("value"));
-            builder.build(path)?;
+            builder.build(path).await?;
         }
 
         let sstable = SSTable::open(path)?;
@@ -319,8 +319,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_seek_boundary() -> Result<()> {
+    #[tokio::test]
+    async fn test_seek_boundary() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
 
@@ -329,7 +329,7 @@ mod tests {
             builder.add(Bytes::from("b"), Record::put_from_slice("value1"));
             builder.add(Bytes::from("d"), Record::put_from_slice("value2"));
             builder.add(Bytes::from("f"), Record::put_from_slice("value3"));
-            builder.build(path)?;
+            builder.build(path).await?;
         }
 
         let sstable = SSTable::open(path)?;
@@ -352,25 +352,25 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_empty_sstable() {
+    #[tokio::test]
+    async fn test_empty_sstable() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
 
         let builder = SSTableBuilder::new(1024);
-        let result = builder.build(path);
+        let result = builder.build(path).await;
         assert!(result.is_err(), "Building empty SSTable should error");
     }
 
-    #[test]
-    fn test_reopen_persistence() -> Result<()> {
+    #[tokio::test]
+    async fn test_reopen_persistence() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
 
         {
             let mut builder = SSTableBuilder::new(1024);
             builder.add(Bytes::from("persist"), Record::put_from_slice("data"));
-            builder.build(path)?;
+            builder.build(path).await?;
         }
 
         let sstable = SSTable::open(path)?;
@@ -381,8 +381,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_sstable_iterator() -> Result<()> {
+    #[tokio::test]
+    async fn test_sstable_iterator() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
 
@@ -391,10 +391,10 @@ mod tests {
         builder.add(Bytes::from("b"), Record::put_from_slice("val_b"));
         builder.add(Bytes::from("c"), Record::put_from_slice("val_c"));
         builder.add(Bytes::from("d"), Record::put_from_slice("val_d"));
-        builder.build(path)?;
+        builder.build(path).await?;
 
         let sstable = Arc::new(SSTable::open(path)?);
-        let mut iter = SSTableIterator::new(sstable)?;
+        let mut iter = SSTableIterator::new(sstable);
 
         assert_eq!(
             iter.next(),
@@ -417,17 +417,17 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_sstable_iterator_empty() -> Result<()> {
+    #[tokio::test]
+    async fn test_sstable_iterator_empty() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
 
         let mut builder = SSTableBuilder::new(1024);
         builder.add(Bytes::from("key"), Record::put_from_slice("value"));
-        builder.build(path)?;
+        builder.build(path).await?;
 
         let sstable = Arc::new(SSTable::open(path)?);
-        let mut iter = SSTableIterator::new(sstable)?;
+        let mut iter = SSTableIterator::new(sstable);
         assert!(iter.next().is_some());
         assert!(iter.next().is_none());
 

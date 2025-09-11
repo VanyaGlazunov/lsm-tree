@@ -1,6 +1,5 @@
 use anyhow::Result;
 use bytes::Bytes;
-use lsm_tree::lsm_storage::LSMStorage;
 use lsm_tree::memtable::BtreeMapMemtable;
 use lsm_tree::options::LSMStorageOptions;
 use std::result::Result::Ok;
@@ -8,12 +7,10 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Barrier;
 
-type Storage = LSMStorage<BtreeMapMemtable>;
-
 #[tokio::test]
 async fn test_sstable_priority() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
     let key = b"key";
 
     let old = Bytes::from("old");
@@ -21,11 +18,11 @@ async fn test_sstable_priority() -> Result<()> {
     storage.insert(key, old).await?;
     storage.close().await?;
 
-    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
     storage.insert(key, new.clone()).await?;
     storage.close().await?;
 
-    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
     let actual = storage.get(key).await?;
     assert_eq!(actual, Some(new));
     Ok(())
@@ -34,15 +31,11 @@ async fn test_sstable_priority() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_write_non_overlapping_keys() -> Result<()> {
     let dir = tempdir()?;
+
     let storage = Arc::new(
-        Storage::open(
-            &dir,
-            LSMStorageOptions {
-                memtables_size: 100,
-                ..Default::default()
-            },
-        )
-        .await?,
+        LSMStorageOptions::default()
+            .memtable_size(100)
+            .open::<BtreeMapMemtable>(&dir)?,
     );
 
     let num_tasks = num_cpus::get();
@@ -79,15 +72,11 @@ async fn test_concurrent_write_non_overlapping_keys() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_read_non_overlapping_keys() -> Result<()> {
     let dir = tempdir()?;
+
     let storage = Arc::new(
-        Storage::open(
-            &dir,
-            LSMStorageOptions {
-                memtables_size: 100,
-                ..Default::default()
-            },
-        )
-        .await?,
+        LSMStorageOptions::default()
+            .memtable_size(100)
+            .open::<BtreeMapMemtable>(&dir)?,
     );
 
     let num_tasks = num_cpus::get();
@@ -128,7 +117,7 @@ async fn test_concurrent_read_non_overlapping_keys() -> Result<()> {
 #[tokio::test]
 async fn test_large_value() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
 
     let expected = Bytes::from_owner(vec![1u8; 1 << 28]); // 256 mb
     let key = b"key";
@@ -137,7 +126,7 @@ async fn test_large_value() -> Result<()> {
     assert_eq!(actual, Some(expected.clone()));
 
     storage.close().await?;
-    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
     let actual = storage.get(&key).await?;
     assert_eq!(actual, Some(expected));
 
@@ -147,14 +136,10 @@ async fn test_large_value() -> Result<()> {
 #[tokio::test]
 async fn test_repeat_same_key() -> Result<()> {
     let dir = tempdir()?;
-    let storage = Storage::open(
-        &dir,
-        LSMStorageOptions {
-            memtables_size: 1,
-            ..Default::default()
-        },
-    )
-    .await?;
+
+    let storage = LSMStorageOptions::default()
+        .memtable_size(1)
+        .open::<BtreeMapMemtable>(&dir)?;
 
     let key = b"key";
     for i in 0..100 {
@@ -169,14 +154,9 @@ async fn test_repeat_same_key() -> Result<()> {
 
     // make sure everything is flushed.
     storage.close().await?;
-    let storage = Storage::open(
-        &dir,
-        LSMStorageOptions {
-            memtables_size: 1,
-            ..Default::default()
-        },
-    )
-    .await?;
+    let storage = LSMStorageOptions::default()
+        .memtable_size(1)
+        .open::<BtreeMapMemtable>(&dir)?;
 
     storage.delete(&key).await?;
     let actual = storage.get(&key).await?;
@@ -188,13 +168,12 @@ async fn test_repeat_same_key() -> Result<()> {
 #[tokio::test]
 async fn test_flush_race_conditions() -> Result<()> {
     let dir = tempdir()?;
-    let options = LSMStorageOptions {
-        memtables_size: 1, // Force immediate flushing
-        num_flush_jobs: 2,
-        ..Default::default()
-    };
 
-    let storage = Storage::open(&dir, options).await?;
+    let options = LSMStorageOptions::default()
+        .memtable_size(1)
+        .num_flush_jobs(2);
+
+    let storage = options.clone().open::<BtreeMapMemtable>(&dir)?;
 
     let expected = Bytes::from("value");
     for i in 0..100 {
@@ -212,7 +191,7 @@ async fn test_flush_race_conditions() -> Result<()> {
     storage.close().await?;
 
     // Verify persistence after forced flushes
-    let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+    let storage = options.open::<BtreeMapMemtable>(&dir)?;
     for i in 0..100 {
         let key = format!("key-{}", i).into_bytes();
         let actual = storage.get(&key).await?;

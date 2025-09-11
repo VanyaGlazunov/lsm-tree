@@ -9,16 +9,16 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{mpsc::{Receiver, Sender}, Mutex, RwLock, RwLockWriteGuard},
+    sync::{mpsc, watch, Mutex, RwLock, RwLockWriteGuard},
     task::JoinHandle,
 };
 
 use crate::{
-    flush_system::{start_flush_workers, FlushResult},
+    compaction::CompactionResult,
     manifest::{Manifest, ManifestRecord},
     memtable::Memtable,
     options::LSMStorageOptions,
@@ -27,6 +27,8 @@ use crate::{
 };
 
 const TOMBSTONE: Record = Record::Delete;
+const FLUSH_CHANNEL_SIZE: usize = 100;
+const STATE_CHANNEL_SIZE: usize = 100;
 
 pub(crate) type ImmutableMemtableMap<M> = BTreeMap<usize, Arc<M>>;
 pub(crate) type SSTableMap = BTreeMap<usize, SSTable>;
@@ -46,6 +48,7 @@ pub(crate) async fn flush_memtable(
     let id = memtable.get_id();
     builder
         .build(SSTable::get_sst_path(path, id))
+        .await
         .context(format!("Failed to flush memtable. id: {id}"))
 }
 
@@ -100,13 +103,22 @@ pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
     memtable: RwLock<M>,  // Active mutable memtable
     state: Arc<State<M>>,
     state_update_handle: JoinHandle<()>,
-    flush_sender: Sender<Arc<M>>,
+    flush_sender: mpsc::Sender<Arc<M>>,
+    compaction_cts: watch::Sender<()>,
     wal: Mutex<Wal>,
 }
 
-impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
+#[derive(Debug)]
+pub(crate) enum StateUpdateEvent {
+    FlushComplete(usize, SSTable),
+    FlushFail(Error),
+    CompactionComplete(CompactionResult),
+    CompactionFailed(Error),
+}
+
+impl<M: Memtable + Send + Sync> LSMStorage<M> {
     /// Opens/Creates storage in path given.
-    pub async fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         create_dir_all(path).context("Failed to create DB directory")?;
 
@@ -122,14 +134,20 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
 
         let memtables_to_flush = Self::recover_memtables_from_wal(path, &mut recovery_state)?;
 
-        let (cmd_tx, res_rx) = start_flush_workers::<M>(
+        let (flush_tx, flush_rx) = mpsc::channel(FLUSH_CHANNEL_SIZE);
+        let (state_update_tx, state_update_rx) = mpsc::channel(STATE_CHANNEL_SIZE);
+
+        Self::start_flush_workers(
             path.to_path_buf(),
             options.num_flush_jobs,
             options.block_size,
+            flush_rx,
+            state_update_tx.clone(),
         );
+
         for mem_id in memtables_to_flush {
             if let Some(mem) = recovery_state.imm_memtables.get(&mem_id) {
-                cmd_tx.send(mem.clone()).await?;
+                flush_tx.blocking_send(mem.clone())?;
             }
         }
 
@@ -145,45 +163,104 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             imm_memtables: RwLock::new(recovery_state.imm_memtables),
             levels: RwLock::new(recovery_state.levels),
             sstables: RwLock::new(recovery_state.sstables),
-            next_sst_id: AtomicUsize::new(next_sst_id),
+            next_sst_id: AtomicUsize::new(next_sst_id + 1),
             manifest: Mutex::new(manifest),
             options,
         });
 
-        let state_update_handle = Self::init_state_update(state.clone(), res_rx);
+        let (compaction_tx, compaction_rx) = watch::channel(());
+        Self::start_compaction_worker(state.clone(), state_update_tx.clone(), compaction_rx);
+
+        let state_update_handle = Self::init_state_update(state.clone(), state_update_rx);
 
         Ok(Self {
             swap_lock: Mutex::new(()),
             memtable,
             state,
             state_update_handle,
-            flush_sender: cmd_tx,
+            flush_sender: flush_tx,
+            compaction_cts: compaction_tx,
             wal,
         })
     }
 
-    fn init_state_update(state: Arc<State<M>>, mut flush_receiver: Receiver<FlushResult>) -> JoinHandle<()> {
+    fn init_state_update(
+        state: Arc<State<M>>,
+        mut state_update_receiver: mpsc::Receiver<StateUpdateEvent>,
+    ) -> JoinHandle<()> {
         tokio::spawn({
             async move {
-                while let Some(result) = flush_receiver.recv().await {
-                    let id = result.id;
-                    let sst = result.sstable;
-                    state
-                        .manifest
-                        .lock()
-                        .await
-                        .add_record(ManifestRecord::Flush(id))
-                        .unwrap();
+                while let Some(result) = state_update_receiver.recv().await {
+                    match result {
+                        StateUpdateEvent::FlushComplete(id, sst) => {
+                            state
+                                .manifest
+                                .lock()
+                                .await
+                                .add_record(ManifestRecord::Flush(id))
+                                .unwrap();
 
-                    state.sstables.write().await.insert(id, sst);
+                            state.sstables.write().await.insert(id, sst);
 
-                    state.levels.write().await[0].push(id);
+                            state.levels.write().await[0].push(id);
 
-                    state.imm_memtables.write().await.remove(&id);
+                            state.imm_memtables.write().await.remove(&id);
 
-                    let wal_path = Wal::get_wal_path(&state.path, id);
-                    if let Err(e) = remove_file(&wal_path) {
-                        eprintln!("Failed to remove WAL file {wal_path:?}: {e}");
+                            let wal_path = Wal::get_wal_path(&state.path, id);
+                            if let Err(e) = remove_file(&wal_path) {
+                                eprintln!("Failed to remove WAL file {wal_path:?}: {e}");
+                            }
+                        }
+                        StateUpdateEvent::FlushFail(e) => {
+                            eprintln!("Error during flush: {}", e)
+                        }
+                        //FIXME
+                        StateUpdateEvent::CompactionComplete(CompactionResult {
+                            task,
+                            new_id,
+                            new_sst,
+                        }) => {
+                            let source = task.source_level;
+                            let target = source + 1;
+
+                            let old_ids = [task.source_level_ssts, task.target_level_ssts].concat();
+                            let manifest_record = ManifestRecord::Compaction {
+                                level: target,
+                                add_stts: vec![new_id],
+                                remove_stts: old_ids.clone(),
+                            };
+
+                            {
+                                let manifest = state.manifest.lock().await;
+                                let mut sstables = state.sstables.write().await;
+                                let mut levels = state.levels.write().await;
+
+                                manifest.add_record(manifest_record).unwrap();
+
+                                for level in levels.iter_mut() {
+                                    level.retain(|id| !old_ids.contains(id));
+                                }
+
+                                for id in old_ids {
+                                    sstables.remove(&id);
+                                }
+
+                                while levels.len() <= target {
+                                    levels.push(Vec::new());
+                                }
+
+                                sstables.insert(new_id, new_sst);
+
+                                levels[target].push(new_id);
+
+                                levels[target].sort_unstable_by_key(|id| {
+                                    sstables.get(id).map_or(Bytes::new(), |sst| sst.first_key())
+                                });
+                            }
+                        }
+                        StateUpdateEvent::CompactionFailed(e) => {
+                            eprintln!("Error during compaction: {}", e)
+                        }
                     }
                 }
             }
@@ -306,6 +383,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
         }
 
         drop(self.flush_sender);
+        self.compaction_cts.send(())?;
 
         self.state_update_handle.await?;
 
@@ -408,9 +486,9 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
     }
 
     async fn flush(&self, mut memtable: RwLockWriteGuard<'_, M>) -> Result<()> {
-        let old_id = self.state.next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let old_id = memtable.get_id();
+        let new_id = self.state.next_sst_id.fetch_add(1, Ordering::SeqCst);
 
-        let new_id = old_id + 1;
         let new_memtable = M::new(new_id);
         let new_wal_path = Wal::get_wal_path(&self.state.path, new_id);
         let new_wal = Wal::open(new_wal_path, self.state.options.durable_wal)?;
@@ -428,7 +506,7 @@ impl<M: Memtable + Clone + Send + Sync + std::fmt::Debug> LSMStorage<M> {
             .manifest
             .lock()
             .await
-            .add_record(ManifestRecord::NewMemtable(old_id))
+            .add_record(ManifestRecord::NewMemtable(new_id))
             .context("Failed to add NewMemtable record to manifest")?;
 
         self.state
@@ -461,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_crud() -> Result<()> {
         let dir = tempdir()?;
-        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
 
         let expected = Bytes::from("val1");
         let key = b"key";
@@ -482,13 +560,13 @@ mod tests {
     async fn test_persistence() -> Result<()> {
         let dir = tempdir()?;
 
-        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
         let key = b"key";
         let expected = Bytes::from("data");
         storage.insert(&key, expected.clone()).await?;
         storage.close().await?;
 
-        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
         let actual = storage.get(&key).await?;
         assert_eq!(actual, Some(expected));
         Ok(())
@@ -503,17 +581,47 @@ mod tests {
                 memtables_size: 1,
                 ..Default::default()
             },
-        )
-        .await?;
+        )?;
 
         let key = b"key";
         let expected = Bytes::from("data");
         storage.insert(key.clone(), expected.clone()).await?;
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait for flush
         storage.close().await?;
-        let storage = Storage::open(&dir, LSMStorageOptions::default()).await?;
+        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
         let actual = storage.get(key).await?;
         assert_eq!(actual, Some(expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compaction_is_triggered_automatically() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let storage = LSMStorageOptions::default()
+            .max_l0_ssts(2)
+            .open::<BtreeMapMemtable>(&dir)?;
+
+        storage.insert(b"a", Bytes::from("1")).await.unwrap();
+        storage.insert(b"b", Bytes::from("1")).await.unwrap();
+        storage.force_flush().await.unwrap();
+
+        storage.insert(b"c", Bytes::from("2")).await.unwrap();
+        storage.insert(b"d", Bytes::from("2")).await.unwrap();
+        storage.force_flush().await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let levels = storage.state.levels.read().await;
+
+        assert!(levels[0].is_empty());
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[1].len(), 1);
+
+        assert_eq!(storage.get(&b"a").await.unwrap(), Some(Bytes::from("1")));
+        assert_eq!(storage.get(&b"b").await.unwrap(), Some(Bytes::from("1")));
+        assert_eq!(storage.get(&b"c").await.unwrap(), Some(Bytes::from("2")));
+        assert_eq!(storage.get(&b"d").await.unwrap(), Some(Bytes::from("2")));
+
         Ok(())
     }
 }

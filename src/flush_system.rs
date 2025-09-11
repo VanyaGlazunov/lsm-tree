@@ -1,65 +1,53 @@
 use std::{path::PathBuf, sync::Arc};
 
-use tokio::sync::{mpsc::Receiver, Semaphore};
+use tokio::sync::{mpsc, Semaphore};
 
-use crate::lsm_storage::flush_memtable;
-use crate::{memtable::Memtable, sstable::SSTable};
+use crate::lsm_storage::{flush_memtable, LSMStorage, StateUpdateEvent};
+use crate::memtable::Memtable;
 
-const FLUSH_CHANNEL_SIZE: usize = 100;
+impl<M: Memtable + Send + Sync> LSMStorage<M> {
+    pub(crate) fn start_flush_workers(
+        path: PathBuf,
+        num_jobs: usize,
+        block_size: usize,
+        flush_receiver: mpsc::Receiver<Arc<M>>,
+        state_update_sender: mpsc::Sender<StateUpdateEvent>,
+    ) {
+        tokio::spawn({
+            async move {
+                let semaphore = Arc::new(Semaphore::new(num_jobs));
+                let mut receiver = flush_receiver;
+                let path = Arc::new(path);
 
-#[derive(Debug)]
-pub struct FlushResult {
-    pub id: usize,
-    pub sstable: SSTable,
-}
+                while let Some(memtable) = receiver.recv().await {
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break, // Semaphore closed
+                    };
+                    let state_update_sender = state_update_sender.clone();
+                    let path = path.clone();
 
-pub fn start_flush_workers<M: Memtable + Send + Sync + 'static>(
-    path: PathBuf,
-    num_jobs: usize,
-    block_size: usize,
-) -> (
-    tokio::sync::mpsc::Sender<Arc<M>>,
-    tokio::sync::mpsc::Receiver<FlushResult>,
-) {
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
-    let (res_tx, res_rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
+                    tokio::spawn(async move {
+                        let id = memtable.get_id();
 
-    tokio::spawn({
-        async move {
-            let semaphore = Arc::new(Semaphore::new(num_jobs));
-            let mut receiver: Receiver<Arc<M>> = cmd_rx;
-            let path = Arc::new(path);
+                        match flush_memtable(block_size, &*path, &*memtable).await {
+                            Ok(sst) => state_update_sender
+                                .send(StateUpdateEvent::FlushComplete(id, sst))
+                                .await
+                                .unwrap(),
+                            Err(e) => state_update_sender
+                                .send(StateUpdateEvent::FlushFail(e))
+                                .await
+                                .unwrap(),
+                        }
 
-            while let Some(memtable) = receiver.recv().await {
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break, // Semaphore closed
-                };
-                let res_tx = res_tx.clone();
-                let path = path.clone();
+                        drop(permit);
+                    });
+                }
 
-                tokio::spawn(async move {
-                    let id = memtable.get_id();
-
-                    // TODO: Error handling
-                    let sst = flush_memtable(block_size, &*path, &*memtable)
-                        .await
-                        .unwrap();
-
-                    let result = FlushResult { id, sstable: sst };
-
-                    if res_tx.send(result).await.is_err() {
-                        eprintln!("Flush result receiver closed. Dropping flush result.");
-                    }
-
-                    drop(permit);
-                });
+                // Wait for remaining permits
+                let _ = semaphore.acquire_many(num_jobs as u32).await;
             }
-
-            // Wait for remaining permits
-            let _ = semaphore.acquire_many(num_jobs as u32).await;
-        }
-    });
-
-    (cmd_tx, res_rx)
+        });
+    }
 }
