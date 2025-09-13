@@ -1,17 +1,21 @@
 use anyhow::Result;
 use std::{
-    sync::{atomic::Ordering, Arc},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
     sync::{mpsc::Sender, watch},
     task::JoinHandle,
-    time,
 };
 
 use crate::{
-    lsm_storage::{LSMStorage, Levels, SSTableMap, State, StateUpdateEvent},
+    lsm_storage::{LSMStorage, Levels, SSTableMap, StateSnapshot, StateUpdateEvent},
     memtable::Memtable,
+    options::LSMStorageOptions,
     sstable::{builder::SSTableBuilder, merge_iterator::MergeIterator, SSTable, SSTableIterator},
 };
 
@@ -22,42 +26,6 @@ pub struct CompactionResult {
     pub task: CompactionTask,
     pub new_id: usize,
     pub new_sst: SSTable,
-}
-
-pub async fn run_compaction<M: Memtable + Send + Sync>(
-    task: CompactionTask,
-    state: Arc<State<M>>,
-) -> Result<CompactionResult> {
-    let mut iters = Vec::new();
-    let ssts = state.sstables.read().await;
-    for id in task
-        .source_level_ssts
-        .iter()
-        .chain(task.target_level_ssts.iter())
-    {
-        if let Some(sst) = ssts.get(id) {
-            iters.push(SSTableIterator::new(Arc::new(sst.try_clone()?)));
-        }
-    }
-    drop(ssts);
-
-    let merge_iter = MergeIterator::new(iters)?;
-
-    let mut builder = SSTableBuilder::new(state.options.block_size);
-    for (key, value) in merge_iter {
-        builder.add(key, value);
-    }
-
-    let new_id = state.next_sst_id.fetch_add(1, Ordering::SeqCst);
-    let new_sst = builder
-        .build(SSTable::get_sst_path(&state.path, new_id))
-        .await?;
-
-    Ok(CompactionResult {
-        task,
-        new_id,
-        new_sst,
-    })
 }
 
 #[derive(Debug)]
@@ -123,43 +91,85 @@ impl LeveledCompactionStrategy {
 
 impl<M: Memtable + Send + Sync> LSMStorage<M> {
     pub(crate) fn start_compaction_worker(
-        state: Arc<State<M>>,
-        event_sender: Sender<StateUpdateEvent>,
-        cts: watch::Receiver<()>,
+        path: PathBuf,
+        options: LSMStorageOptions,
+        snapshot_receiver: watch::Receiver<StateSnapshot<M>>,
+        event_sender: Sender<StateUpdateEvent<M>>,
+        mut cts: watch::Receiver<()>,
+        next_sst_id: Arc<AtomicUsize>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let strategy = LeveledCompactionStrategy::new(state.options.max_l0_ssts);
-            let mut cts = cts.clone();
+            let strategy = LeveledCompactionStrategy::new(options.max_l0_ssts);
+            let path = Arc::new(path);
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(CHECK_COMPACTION_INTERVAL));
             loop {
                 tokio::select! {
-                    _ = time::sleep(Duration::from_millis(CHECK_COMPACTION_INTERVAL)) => {
-                        let levels = state.levels.read().await;
-                        let sstables = state.sstables.read().await;
+                    _ = interval.tick() => {
+                        let (levels, sstables) = {
+                            let snapshot = snapshot_receiver.borrow();
+                            (
+                                snapshot.levels.clone(),
+                                snapshot.sstables.clone(),
+                            )
+                        };
 
                         if let Some(task) = strategy.pick_compaction(&levels, &sstables) {
-                            drop(levels);
-                            drop(sstables);
-
-                            let state = state.clone();
                             let sender = event_sender.clone();
+                            let path = path.clone();
+                            let next_sst_id = next_sst_id.clone();
 
-                            tokio::spawn(async move {
-                                match run_compaction(task, state).await {
-                                    Ok(result) => {
-                                        sender.send(StateUpdateEvent::CompactionComplete(result)).await.unwrap();
-                                    },
-                                    Err(e) => {
-                                        sender.send(StateUpdateEvent::CompactionFailed(e)).await.unwrap();
-                                    },
-                                }
-                            });
+                            match Self::run_compaction(&path, options.block_size, task, next_sst_id, &sstables).await {
+                                Ok(result) => {
+                                    sender.send(StateUpdateEvent::CompactionComplete(result)).await.unwrap();
+                                },
+                                Err(e) => {
+                                    sender.send(StateUpdateEvent::CompactionFailed(e)).await.unwrap();
+                                },
+                            }
                         }
                     }
                     _ = cts.changed() => {
+                        dbg!("Break");
                         break;
                     }
                 }
             }
+        })
+    }
+
+    pub(crate) async fn run_compaction(
+        path: &Path,
+        block_size: usize,
+        task: CompactionTask,
+        next_sst_id: Arc<AtomicUsize>,
+        sstables: &SSTableMap,
+    ) -> Result<CompactionResult> {
+        let mut iters = Vec::new();
+        for id in task
+            .source_level_ssts
+            .iter()
+            .chain(task.target_level_ssts.iter())
+        {
+            if let Some(sst) = sstables.get(id) {
+                iters.push(SSTableIterator::new(Arc::new(sst.try_clone()?)));
+            }
+        }
+
+        let merge_iter = MergeIterator::new(iters)?;
+
+        let mut builder = SSTableBuilder::new(block_size);
+        for (key, value) in merge_iter {
+            builder.add(key, value);
+        }
+
+        let new_id = next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let new_sst = builder.build(SSTable::get_sst_path(path, new_id)).await?;
+
+        Ok(CompactionResult {
+            task,
+            new_id,
+            new_sst,
         })
     }
 }

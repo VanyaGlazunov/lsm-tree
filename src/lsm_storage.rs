@@ -13,7 +13,7 @@ use anyhow::{Context, Error, Result};
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{mpsc, watch, Mutex, RwLock, RwLockWriteGuard},
+    sync::{mpsc, oneshot, watch, Mutex, RwLock, RwLockWriteGuard},
     task::JoinHandle,
 };
 
@@ -28,14 +28,14 @@ use crate::{
 
 const TOMBSTONE: Record = Record::Delete;
 const FLUSH_CHANNEL_SIZE: usize = 100;
-const STATE_CHANNEL_SIZE: usize = 100;
+const STATE_CHANNEL_SIZE: usize = 300;
 
 pub(crate) type ImmutableMemtableMap<M> = BTreeMap<usize, Arc<M>>;
-pub(crate) type SSTableMap = BTreeMap<usize, SSTable>;
+pub(crate) type SSTableMap = BTreeMap<usize, Arc<SSTable>>;
 pub(crate) type Levels = Vec<Vec<usize>>;
 
 /// Builds SSTable from memtable via SSTableBuilder.
-pub(crate) async fn flush_memtable(
+pub(crate) async fn memtable_to_sst(
     block_size: usize,
     path: impl AsRef<Path>,
     memtable: &impl Memtable,
@@ -78,42 +78,40 @@ impl Record {
     }
 }
 
-/// Consists of data that is needed during flush, compaction.
-pub(crate) struct State<M: Memtable + Send + Sync + 'static> {
-    pub path: PathBuf,                                  // Storage directory
-    pub imm_memtables: RwLock<ImmutableMemtableMap<M>>, // Frozen memtables by IDs
-    pub levels: RwLock<Levels>,                         // Compaction levels for ssts
-    pub sstables: RwLock<SSTableMap>,                   // All SSTables by IDs
-    pub next_sst_id: AtomicUsize,                       // SSTable ID counter
-    pub manifest: Mutex<Manifest>,                      // Recovery log
-    pub options: LSMStorageOptions,                     // Configuration
+pub(crate) struct StateSnapshot<M: Memtable + Send + Sync + 'static> {
+    pub imm_memtables: ImmutableMemtableMap<M>,
+    pub levels: Levels,
+    pub sstables: SSTableMap,
 }
 
-struct RecoveryState<M> {
-    levels: Levels,
-    sstables: SSTableMap,
-    sst_to_level: BTreeMap<usize, usize>,
-    imm_memtables: ImmutableMemtableMap<M>,
-    next_sst_id: usize,
+pub(crate) struct StateWriterContext<M: Memtable + Send + Sync + 'static> {
+    pub manifest: Mutex<Manifest>,
+    pub snapshot_sender: watch::Sender<StateSnapshot<M>>,
 }
 
 /// Main storage engine.
 pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
-    swap_lock: Mutex<()>, // Memtable swap synchronization
-    memtable: RwLock<M>,  // Active mutable memtable
-    state: Arc<State<M>>,
+    path: PathBuf,
+    next_sst_id: Arc<AtomicUsize>,
+    swap_lock: Mutex<()>,
+    memtable: RwLock<M>,
+    state_snapshot_receiver: watch::Receiver<StateSnapshot<M>>,
+    state_update_sender: mpsc::Sender<StateUpdateEvent<M>>,
     state_update_handle: JoinHandle<()>,
     flush_sender: mpsc::Sender<Arc<M>>,
     compaction_cts: watch::Sender<()>,
     wal: Mutex<Wal>,
+    options: LSMStorageOptions,
 }
 
 #[derive(Debug)]
-pub(crate) enum StateUpdateEvent {
+pub(crate) enum StateUpdateEvent<M: Memtable> {
     FlushComplete(usize, SSTable),
     FlushFail(Error),
     CompactionComplete(CompactionResult),
     CompactionFailed(Error),
+    NewMemtable(Arc<M>, Option<usize>, oneshot::Sender<()>),
+    Close(usize),
 }
 
 impl<M: Memtable + Send + Sync> LSMStorage<M> {
@@ -128,85 +126,117 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
         } else {
             (Manifest::new(manifest_path)?, Vec::new())
         };
-        let mut recovery_state = Self::recover_state_from_manifest(records)?;
+        let (levels, sst_to_level, mut next_sst_id) = Self::recover_state_from_manifest(records)?;
 
-        Self::load_sstables(path, &mut recovery_state)?;
+        let sstables = Self::load_sstables(path, &levels)?;
 
-        let memtables_to_flush = Self::recover_memtables_from_wal(path, &mut recovery_state)?;
+        let (imm_memtables, memtables_to_flush) =
+            Self::recover_memtables_from_wal(path, &sst_to_level, &mut next_sst_id)?;
 
         let (flush_tx, flush_rx) = mpsc::channel(FLUSH_CHANNEL_SIZE);
-        let (state_update_tx, state_update_rx) = mpsc::channel(STATE_CHANNEL_SIZE);
+        let (state_update_sender, state_update_rx) = mpsc::channel(STATE_CHANNEL_SIZE);
 
         Self::start_flush_workers(
             path.to_path_buf(),
             options.num_flush_jobs,
             options.block_size,
             flush_rx,
-            state_update_tx.clone(),
+            state_update_sender.clone(),
         );
 
         for mem_id in memtables_to_flush {
-            if let Some(mem) = recovery_state.imm_memtables.get(&mem_id) {
+            if let Some(mem) = imm_memtables.get(&mem_id) {
                 flush_tx.blocking_send(mem.clone())?;
             }
         }
 
-        let next_sst_id = recovery_state.next_sst_id;
         manifest.add_record(ManifestRecord::NewMemtable(next_sst_id))?;
-
-        let memtable = RwLock::new(M::new(next_sst_id));
+        let memtable = M::new(next_sst_id);
         let wal_path = Wal::get_wal_path(path, next_sst_id);
-        let wal = Mutex::new(Wal::open(&wal_path, options.durable_wal)?);
+        next_sst_id += 1;
+        let wal = Wal::open(&wal_path, options.durable_wal)?;
 
-        let state = Arc::new(State::<M> {
-            path: path.to_path_buf(),
-            imm_memtables: RwLock::new(recovery_state.imm_memtables),
-            levels: RwLock::new(recovery_state.levels),
-            sstables: RwLock::new(recovery_state.sstables),
-            next_sst_id: AtomicUsize::new(next_sst_id + 1),
-            manifest: Mutex::new(manifest),
-            options,
+        let snapshot = StateSnapshot {
+            imm_memtables,
+            levels,
+            sstables,
+        };
+
+        let (snapshot_tx, snapshot_rx) = watch::channel(snapshot);
+
+        let context = Arc::new(StateWriterContext {
+            manifest: manifest.into(),
+            snapshot_sender: snapshot_tx,
         });
 
         let (compaction_tx, compaction_rx) = watch::channel(());
-        Self::start_compaction_worker(state.clone(), state_update_tx.clone(), compaction_rx);
+        let next_sst_id = Arc::new(AtomicUsize::new(next_sst_id));
+        Self::start_compaction_worker(
+            path.to_path_buf(),
+            options.clone(),
+            snapshot_rx.clone(),
+            state_update_sender.clone(),
+            compaction_rx,
+            next_sst_id.clone(),
+        );
 
-        let state_update_handle = Self::init_state_update(state.clone(), state_update_rx);
+        let state_update_handle =
+            Self::init_state_update(path.to_path_buf(), context.clone(), state_update_rx);
 
         Ok(Self {
+            path: path.to_path_buf(),
+            next_sst_id,
+            state_update_sender,
             swap_lock: Mutex::new(()),
-            memtable,
-            state,
+            memtable: memtable.into(),
+            state_snapshot_receiver: snapshot_rx,
             state_update_handle,
             flush_sender: flush_tx,
             compaction_cts: compaction_tx,
-            wal,
+            options,
+            wal: wal.into(),
         })
     }
 
     fn init_state_update(
-        state: Arc<State<M>>,
-        mut state_update_receiver: mpsc::Receiver<StateUpdateEvent>,
+        path: PathBuf,
+        context: Arc<StateWriterContext<M>>,
+        mut state_update_receiver: mpsc::Receiver<StateUpdateEvent<M>>,
     ) -> JoinHandle<()> {
         tokio::spawn({
             async move {
                 while let Some(result) = state_update_receiver.recv().await {
                     match result {
                         StateUpdateEvent::FlushComplete(id, sst) => {
-                            state
+                            context
                                 .manifest
                                 .lock()
                                 .await
                                 .add_record(ManifestRecord::Flush(id))
                                 .unwrap();
 
-                            state.sstables.write().await.insert(id, sst);
+                            let (mut imm_memtables, mut sstables, mut levels) = {
+                                let snapshot = context.snapshot_sender.borrow();
+                                (
+                                    snapshot.imm_memtables.clone(),
+                                    snapshot.sstables.clone(),
+                                    snapshot.levels.clone(),
+                                )
+                            };
 
-                            state.levels.write().await[0].push(id);
+                            sstables.insert(id, sst.into());
+                            levels[0].push(id);
+                            imm_memtables.remove(&id);
 
-                            state.imm_memtables.write().await.remove(&id);
+                            let new_snapshot = StateSnapshot {
+                                sstables,
+                                levels,
+                                imm_memtables,
+                            };
 
-                            let wal_path = Wal::get_wal_path(&state.path, id);
+                            context.snapshot_sender.send(new_snapshot).unwrap();
+
+                            let wal_path = Wal::get_wal_path(&path, id);
                             if let Err(e) = remove_file(&wal_path) {
                                 eprintln!("Failed to remove WAL file {wal_path:?}: {e}");
                             }
@@ -214,7 +244,6 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                         StateUpdateEvent::FlushFail(e) => {
                             eprintln!("Error during flush: {}", e)
                         }
-                        //FIXME
                         StateUpdateEvent::CompactionComplete(CompactionResult {
                             task,
                             new_id,
@@ -230,36 +259,89 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                                 remove_stts: old_ids.clone(),
                             };
 
-                            {
-                                let manifest = state.manifest.lock().await;
-                                let mut sstables = state.sstables.write().await;
-                                let mut levels = state.levels.write().await;
+                            context
+                                .manifest
+                                .lock()
+                                .await
+                                .add_record(manifest_record)
+                                .unwrap();
 
-                                manifest.add_record(manifest_record).unwrap();
+                            let (imm_memtables, mut sstables, mut levels) = {
+                                let snapshot = context.snapshot_sender.borrow();
+                                (
+                                    snapshot.imm_memtables.clone(),
+                                    snapshot.sstables.clone(),
+                                    snapshot.levels.clone(),
+                                )
+                            };
 
-                                for level in levels.iter_mut() {
-                                    level.retain(|id| !old_ids.contains(id));
-                                }
-
-                                for id in old_ids {
-                                    sstables.remove(&id);
-                                }
-
-                                while levels.len() <= target {
-                                    levels.push(Vec::new());
-                                }
-
-                                sstables.insert(new_id, new_sst);
-
-                                levels[target].push(new_id);
-
-                                levels[target].sort_unstable_by_key(|id| {
-                                    sstables.get(id).map_or(Bytes::new(), |sst| sst.first_key())
-                                });
+                            for level in &mut levels {
+                                level.retain(|id| !old_ids.contains(id));
                             }
+
+                            for id in old_ids {
+                                sstables.remove(&id);
+                            }
+
+                            while levels.len() <= target {
+                                levels.push(Vec::new());
+                            }
+
+                            sstables.insert(new_id, new_sst.into());
+
+                            levels[target].push(new_id);
+
+                            levels[target].sort_unstable_by_key(|id| {
+                                sstables.get(id).map_or(Bytes::new(), |sst| sst.first_key())
+                            });
+
+                            let new_snapshot = StateSnapshot {
+                                levels,
+                                imm_memtables,
+                                sstables,
+                            };
+
+                            context.snapshot_sender.send(new_snapshot).unwrap();
                         }
                         StateUpdateEvent::CompactionFailed(e) => {
                             eprintln!("Error during compaction: {}", e)
+                        }
+                        StateUpdateEvent::NewMemtable(old_memtable, new_id, ack) => {
+                            if let Some(new_id) = new_id {
+                                context
+                                    .manifest
+                                    .lock()
+                                    .await
+                                    .add_record(ManifestRecord::NewMemtable(new_id))
+                                    .context("Failed to add NewMemtable record to manifest")
+                                    .unwrap();
+                            }
+
+                            let (mut imm_memtables, sstables, levels) = {
+                                let snapshot = context.snapshot_sender.borrow();
+                                (
+                                    snapshot.imm_memtables.clone(),
+                                    snapshot.sstables.clone(),
+                                    snapshot.levels.clone(),
+                                )
+                            };
+                            imm_memtables.insert(old_memtable.get_id(), old_memtable);
+                            let new_snapshot = StateSnapshot {
+                                imm_memtables,
+                                sstables,
+                                levels,
+                            };
+                            context.snapshot_sender.send(new_snapshot).unwrap();
+
+                            ack.send(()).unwrap();
+                        }
+                        StateUpdateEvent::Close(id) => {
+                            context
+                                .manifest
+                                .lock()
+                                .await
+                                .add_record(ManifestRecord::Flush(id))
+                                .unwrap();
                         }
                     }
                 }
@@ -267,10 +349,13 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
         })
     }
 
-    fn recover_state_from_manifest(records: Vec<ManifestRecord>) -> Result<RecoveryState<M>> {
+    fn recover_state_from_manifest(
+        records: Vec<ManifestRecord>,
+    ) -> Result<(Levels, BTreeMap<usize, usize>, usize)> {
         let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
         let mut sst_to_level = BTreeMap::<usize, usize>::new();
         let mut next_sst_id = 0_usize;
+        dbg!(&records);
 
         for record in records {
             match record {
@@ -288,9 +373,15 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                     remove_stts,
                 } => {
                     for sst_id in &remove_stts {
+                        dbg!(format!("sstid {}", sst_id));
                         if let Some(from_level) = sst_to_level.remove(sst_id) {
                             if let Some(from_level_entries) = levels.get_mut(from_level) {
-                                from_level_entries.remove(*sst_id);
+                                dbg!(&from_level_entries);
+                                let reomove_idx = from_level_entries
+                                    .iter()
+                                    .position(|e| e.eq(sst_id))
+                                    .unwrap();
+                                from_level_entries.remove(reomove_idx);
                             }
                         }
                     }
@@ -308,34 +399,30 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
             }
         }
 
-        Ok(RecoveryState {
-            levels,
-            sstables: BTreeMap::new(),
-            imm_memtables: ImmutableMemtableMap::new(),
-            sst_to_level,
-            next_sst_id: next_sst_id + 1,
-        })
+        Ok((levels, sst_to_level, next_sst_id + 1))
     }
 
-    fn load_sstables(path: &Path, recovery_state: &mut RecoveryState<M>) -> Result<()> {
-        for level in &recovery_state.levels {
+    fn load_sstables(path: &Path, levels: &Levels) -> Result<SSTableMap> {
+        let mut sstables = SSTableMap::new();
+        for level in levels {
             for id in level {
                 let sstable_path = SSTable::get_sst_path(path, *id);
                 let sstable = SSTable::open(&sstable_path)
                     .context(format!("Cannot open sst {sstable_path:?}"))?;
-                recovery_state.sstables.insert(*id, sstable);
+                sstables.insert(*id, sstable.into());
             }
         }
-        Ok(())
+        Ok(sstables)
     }
 
     fn recover_memtables_from_wal(
         path: &Path,
-        recovery_state: &mut RecoveryState<M>,
-    ) -> Result<Vec<usize>> {
+        sst_to_level: &BTreeMap<usize, usize>,
+        next_sst_id: &mut usize,
+    ) -> Result<(ImmutableMemtableMap<M>, Vec<usize>)> {
         let mut imm_memtables_map = BTreeMap::<usize, Arc<M>>::new();
         let mut memtables_to_flush = Vec::new();
-        let all_sst_ids: HashSet<usize> = recovery_state.sst_to_level.keys().cloned().collect();
+        let all_sst_ids: HashSet<usize> = sst_to_level.keys().cloned().collect();
 
         for entry in std::fs::read_dir(path)? {
             let entry_path = entry?.path();
@@ -360,29 +447,25 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                     imm_memtables_map.insert(id, memtable_arc.clone());
                     memtables_to_flush.push(id);
                 }
-                recovery_state.next_sst_id = recovery_state.next_sst_id.max(id + 1);
+                *next_sst_id = (*next_sst_id).max(id + 1);
             }
         }
 
-        recovery_state.imm_memtables = imm_memtables_map;
-
-        Ok(memtables_to_flush)
+        Ok((imm_memtables_map, memtables_to_flush))
     }
 
     /// Graceful shutdown (waits until all data will be flushed).
     pub async fn close(self) -> Result<()> {
         let memtable = self.memtable.into_inner();
         if memtable.size_estimate() > 0 {
-            let id = memtable.get_id();
-            flush_memtable(self.state.options.block_size, &self.state.path, &memtable).await?;
-            self.state
-                .manifest
-                .lock()
-                .await
-                .add_record(ManifestRecord::Flush(id))?;
+            memtable_to_sst(self.options.block_size, &self.path, &memtable).await?;
+            self.state_update_sender
+                .send(StateUpdateEvent::Close(memtable.get_id()))
+                .await?;
         }
 
         drop(self.flush_sender);
+        drop(self.state_update_sender);
         self.compaction_cts.send(())?;
 
         self.state_update_handle.await?;
@@ -409,17 +492,20 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
 
         drop(memtable);
 
-        let imm_memtables = self.state.imm_memtables.read().await;
+        let (imm_memtables, sstables, levels) = {
+            let snapshot = self.state_snapshot_receiver.borrow();
+            (
+                snapshot.imm_memtables.clone(),
+                snapshot.sstables.clone(),
+                snapshot.levels.clone(),
+            )
+        };
+
         for imm_memtable in imm_memtables.values().rev() {
             if let Some(rec) = imm_memtable.get(key) {
                 return Ok(rec.into_inner());
             }
         }
-
-        drop(imm_memtables);
-
-        let levels = self.state.levels.read().await;
-        let sstables = self.state.sstables.read().await;
 
         if let Some(level0) = levels.first() {
             for sst_id in level0.iter().rev() {
@@ -470,7 +556,7 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
         let mut memtable = self.memtable.write().await;
         memtable.set(key, value.clone());
 
-        if memtable.size_estimate() > self.state.options.memtables_size {
+        if memtable.size_estimate() > self.options.memtables_size {
             self.flush(memtable)
                 .await
                 .context("Failed to start flushing")?;
@@ -486,12 +572,11 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
     }
 
     async fn flush(&self, mut memtable: RwLockWriteGuard<'_, M>) -> Result<()> {
-        let old_id = memtable.get_id();
-        let new_id = self.state.next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let new_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
 
         let new_memtable = M::new(new_id);
-        let new_wal_path = Wal::get_wal_path(&self.state.path, new_id);
-        let new_wal = Wal::open(new_wal_path, self.state.options.durable_wal)?;
+        let new_wal_path = Wal::get_wal_path(&self.path, new_id);
+        let new_wal = Wal::open(new_wal_path, self.options.durable_wal)?;
 
         let old_memtable;
         {
@@ -500,27 +585,27 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
             let mut current_wal = self.wal.lock().await;
             *current_wal = new_wal;
         };
+        drop(memtable);
+
         let old_memtable = Arc::new(old_memtable);
+        let (ack_tx, ack_rx) = oneshot::channel();
 
-        self.state
-            .manifest
-            .lock()
-            .await
-            .add_record(ManifestRecord::NewMemtable(new_id))
-            .context("Failed to add NewMemtable record to manifest")?;
-
-        self.state
-            .imm_memtables
-            .write()
-            .await
-            .insert(old_id, old_memtable.clone());
+        self.state_update_sender
+            .send(StateUpdateEvent::NewMemtable(
+                old_memtable.clone(),
+                Some(new_id),
+                ack_tx,
+            ))
+            .await?;
 
         self.flush_sender
             .send(old_memtable)
             .await
             .context("Failed to send memtable into flush channel")?;
 
-        drop(memtable);
+        ack_rx
+            .await
+            .context("State update task failed to acknowledge memtable swap")?;
 
         Ok(())
     }
@@ -608,10 +693,9 @@ mod tests {
         storage.insert(b"c", Bytes::from("2")).await.unwrap();
         storage.insert(b"d", Bytes::from("2")).await.unwrap();
         storage.force_flush().await.unwrap();
-
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let levels = storage.state.levels.read().await;
+        let levels = &storage.state_snapshot_receiver.borrow().levels.clone();
 
         assert!(levels[0].is_empty());
         assert_eq!(levels.len(), 2);

@@ -24,7 +24,7 @@ impl PartialOrd for HeapItem {
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.item.0.cmp(&other.item.0).reverse() {
-            Ordering::Equal => self.iterator_idx.cmp(&other.iterator_idx).reverse(),
+            Ordering::Equal => self.iterator_idx.cmp(&other.iterator_idx),
             other => other,
         }
     }
@@ -134,8 +134,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_iterator_duplicates() -> Result<()> {
-        let (sst1, _dir1) = create_sstable(&[("a", "new_a"), ("c", "new_c")]).await?;
-        let (sst2, _dir2) = create_sstable(&[("a", "old_a"), ("b", "b_val")]).await?;
+        let (sst1, _dir1) = create_sstable(&[("a", "old_a"), ("c", "new_c")]).await?;
+        let (sst2, _dir2) = create_sstable(&[("a", "new_a"), ("b", "b_val")]).await?;
 
         let iter1 = SSTableIterator::new(Arc::new(sst1));
         let iter2 = SSTableIterator::new(Arc::new(sst2));
@@ -167,7 +167,7 @@ mod tests {
 
         let iter1 = SSTableIterator::new(sst1);
         let iter2 = SSTableIterator::new(Arc::new(sst2));
-        let mut merge_iter = MergeIterator::new(vec![iter1, iter2])?;
+        let mut merge_iter = MergeIterator::new(vec![iter2, iter1])?;
 
         assert_eq!(merge_iter.next().unwrap().0, "a");
         assert_eq!(merge_iter.next().unwrap().0, "c");

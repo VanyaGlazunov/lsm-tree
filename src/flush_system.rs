@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::lsm_storage::{flush_memtable, LSMStorage, StateUpdateEvent};
+use crate::lsm_storage::{memtable_to_sst, LSMStorage, StateUpdateEvent};
 use crate::memtable::Memtable;
 
 impl<M: Memtable + Send + Sync> LSMStorage<M> {
@@ -11,7 +11,7 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
         num_jobs: usize,
         block_size: usize,
         flush_receiver: mpsc::Receiver<Arc<M>>,
-        state_update_sender: mpsc::Sender<StateUpdateEvent>,
+        state_update_sender: mpsc::Sender<StateUpdateEvent<M>>,
     ) {
         tokio::spawn({
             async move {
@@ -30,7 +30,7 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                     tokio::spawn(async move {
                         let id = memtable.get_id();
 
-                        match flush_memtable(block_size, &*path, &*memtable).await {
+                        match memtable_to_sst(block_size, &*path, &*memtable).await {
                             Ok(sst) => state_update_sender
                                 .send(StateUpdateEvent::FlushComplete(id, sst))
                                 .await
