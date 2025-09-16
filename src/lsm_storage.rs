@@ -79,9 +79,9 @@ impl Record {
 }
 
 pub(crate) struct StateSnapshot<M: Memtable + Send + Sync + 'static> {
-    pub imm_memtables: ImmutableMemtableMap<M>,
-    pub levels: Levels,
-    pub sstables: SSTableMap,
+    pub imm_memtables: Arc<ImmutableMemtableMap<M>>,
+    pub levels: Arc<Levels>,
+    pub sstables: Arc<SSTableMap>,
 }
 
 pub(crate) struct StateWriterContext<M: Memtable + Send + Sync + 'static> {
@@ -157,9 +157,9 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
         let wal = Wal::open(&wal_path, options.durable_wal)?;
 
         let snapshot = StateSnapshot {
-            imm_memtables,
-            levels,
-            sstables,
+            imm_memtables: imm_memtables.into(),
+            levels: levels.into(),
+            sstables: sstables.into(),
         };
 
         let (snapshot_tx, snapshot_rx) = watch::channel(snapshot);
@@ -218,9 +218,9 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                             let (mut imm_memtables, mut sstables, mut levels) = {
                                 let snapshot = context.snapshot_sender.borrow();
                                 (
-                                    snapshot.imm_memtables.clone(),
-                                    snapshot.sstables.clone(),
-                                    snapshot.levels.clone(),
+                                    (*snapshot.imm_memtables).clone(),
+                                    (*snapshot.sstables).clone(),
+                                    (*snapshot.levels).clone(),
                                 )
                             };
 
@@ -229,9 +229,9 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                             imm_memtables.remove(&id);
 
                             let new_snapshot = StateSnapshot {
-                                sstables,
-                                levels,
-                                imm_memtables,
+                                levels: levels.into(),
+                                imm_memtables: imm_memtables.into(),
+                                sstables: sstables.into(),
                             };
 
                             context.snapshot_sender.send(new_snapshot).unwrap();
@@ -270,8 +270,8 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                                 let snapshot = context.snapshot_sender.borrow();
                                 (
                                     snapshot.imm_memtables.clone(),
-                                    snapshot.sstables.clone(),
-                                    snapshot.levels.clone(),
+                                    (*snapshot.sstables).clone(),
+                                    (*snapshot.levels).clone(),
                                 )
                             };
 
@@ -296,9 +296,9 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                             });
 
                             let new_snapshot = StateSnapshot {
-                                levels,
+                                levels: levels.into(),
                                 imm_memtables,
-                                sstables,
+                                sstables: sstables.into(),
                             };
 
                             context.snapshot_sender.send(new_snapshot).unwrap();
@@ -320,14 +320,14 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                             let (mut imm_memtables, sstables, levels) = {
                                 let snapshot = context.snapshot_sender.borrow();
                                 (
-                                    snapshot.imm_memtables.clone(),
+                                    (*snapshot.imm_memtables).clone(),
                                     snapshot.sstables.clone(),
                                     snapshot.levels.clone(),
                                 )
                             };
                             imm_memtables.insert(old_memtable.get_id(), old_memtable);
                             let new_snapshot = StateSnapshot {
-                                imm_memtables,
+                                imm_memtables: imm_memtables.into(),
                                 sstables,
                                 levels,
                             };
@@ -355,7 +355,6 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
         let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
         let mut sst_to_level = BTreeMap::<usize, usize>::new();
         let mut next_sst_id = 0_usize;
-        dbg!(&records);
 
         for record in records {
             match record {
@@ -373,10 +372,8 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                     remove_stts,
                 } => {
                     for sst_id in &remove_stts {
-                        dbg!(format!("sstid {}", sst_id));
                         if let Some(from_level) = sst_to_level.remove(sst_id) {
                             if let Some(from_level_entries) = levels.get_mut(from_level) {
-                                dbg!(&from_level_entries);
                                 let reomove_idx = from_level_entries
                                     .iter()
                                     .position(|e| e.eq(sst_id))

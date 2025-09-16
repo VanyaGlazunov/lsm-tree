@@ -130,7 +130,6 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                         }
                     }
                     _ = cts.changed() => {
-                        dbg!("Break");
                         break;
                     }
                 }

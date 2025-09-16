@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::atomic::AtomicUsize};
 
 use bytes::Bytes;
+use crossbeam_skiplist::SkipMap;
 
 use crate::lsm_storage::Record;
 
@@ -62,5 +63,49 @@ impl Memtable for BtreeMapMemtable {
 
     fn iter(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + '_> {
         Box::new(self.container.iter().map(|(k, v)| (k.clone(), v.clone())))
+    }
+}
+
+/// Memtable implementation based on [SkipMap]
+pub struct SkipListMemtable {
+    id: usize,
+    size: AtomicUsize,
+    container: SkipMap<Bytes, Record>,
+}
+
+impl Memtable for SkipListMemtable {
+    fn new(id: usize) -> Self {
+        Self {
+            id,
+            size: AtomicUsize::new(0),
+            container: SkipMap::new(),
+        }
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Record> {
+        self.container.get(key).map(|e| e.value().clone())
+    }
+
+    fn set(&mut self, key: Bytes, value: Record) {
+        let add = key.len() + value.value_len();
+        self.size
+            .fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+        self.container.insert(key, value);
+    }
+
+    fn get_id(&self) -> usize {
+        self.id
+    }
+
+    fn size_estimate(&self) -> usize {
+        self.size.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + '_> {
+        Box::new(
+            self.container
+                .iter()
+                .map(|e| (e.key().clone(), e.value().clone())),
+        )
     }
 }
