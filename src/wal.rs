@@ -169,24 +169,17 @@ impl Iterator for WalIterator {
         }
         let total_len = u64::from_le_bytes(len_buf);
         let mut entry_buf = vec![0u8; total_len as usize];
-        match reader.read_exact(&mut entry_buf) {
-            Ok(_) => {}
-            Err(e) => return Some(Err(e).context("Failed to read entry data")),
+        if let Err(e) = reader.read_exact(&mut entry_buf) {
+            return Some(Err(e).context("Failed to read entry data"));
         }
 
         let mut entry_reader = &entry_buf[..];
         match WalEntry::decode(&mut entry_reader) {
             Ok(entry) => Some(Ok((entry.key, entry.value))),
-            Err(e)
-                if e.downcast_ref::<io::Error>()
-                    .map(|io_err| io_err.kind() == io::ErrorKind::UnexpectedEof)
-                    .unwrap_or(false) =>
-            {
-                // Partial entry at the end, ignore it
-                eprintln!("WAL is corrupted at the end, stopping replay.");
-                None
+            Err(e) => {
+                self.stop = true;
+                Some(Err(e).context("Failed to decode WAL entry"))
             }
-            Err(e) => Some(Err(e).context("Failed to decode WAL entry")),
         }
     }
 }
@@ -196,7 +189,7 @@ mod tests {
     use super::*;
     use anyhow::{Ok, Result};
     use bytes::Bytes;
-    use std::fs::OpenOptions;
+    use std::{fs::OpenOptions, os::unix::fs::FileExt};
     use tempfile::tempdir;
 
     use crate::lsm_storage::Record;
@@ -269,6 +262,40 @@ mod tests {
         assert_eq!(entries[0], (Bytes::from("a"), Record::put_from_slice("1")));
 
         assert!(entries.len() <= 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_corruption_in_payload_stops_iterator() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test_corrupt_payload.wal");
+
+        {
+            let mut wal = Wal::open(&path, true)?;
+            wal.append(Bytes::from("good1"), &Record::put_from_slice("ok1"))?;
+            wal.append(
+                Bytes::from("bad"),
+                &Record::put_from_slice("this_will_be_corrupted"),
+            )?;
+            wal.append(Bytes::from("good2"), &Record::put_from_slice("ok2"))?;
+        }
+
+        {
+            let file = OpenOptions::new().write(true).open(&path)?;
+            file.write_at(&[0xFF], 50)?;
+        }
+
+        let mut iter = Wal::open(&path, false)?.iter();
+
+        assert_eq!(
+            iter.next().unwrap()?,
+            (Bytes::from("good1"), Record::put_from_slice("ok1"))
+        );
+
+        assert!(iter.next().unwrap().is_err());
+
+        assert!(iter.next().is_none());
+
         Ok(())
     }
 }

@@ -175,7 +175,7 @@ impl SSTable {
         file.read_exact_at(&mut buf[..], block_offset as u64)
             .context("Failed to read block data")?;
 
-        Ok(Block::decode(&buf[..]))
+        Block::decode(&buf[..]).context("Failed to decode block")
     }
 
     pub fn try_clone(&self) -> Result<Self> {

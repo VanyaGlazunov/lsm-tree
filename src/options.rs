@@ -45,8 +45,11 @@ impl LSMStorageOptions {
         self.durable_wal = durable;
         self
     }
-    pub fn open<M: Memtable + Sync + Send>(self, path: impl AsRef<Path>) -> Result<LSMStorage<M>> {
-        LSMStorage::open(path, self)
+    pub async fn open<M: Memtable + Sync + Send + 'static>(
+        self,
+        path: impl AsRef<Path>,
+    ) -> Result<LSMStorage<M>> {
+        LSMStorage::open(path, self).await
     }
 }
 

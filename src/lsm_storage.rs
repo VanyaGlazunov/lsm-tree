@@ -116,7 +116,7 @@ pub(crate) enum StateUpdateEvent<M: Memtable> {
 
 impl<M: Memtable + Send + Sync> LSMStorage<M> {
     /// Opens/Creates storage in path given.
-    pub fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
+    pub async fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         create_dir_all(path).context("Failed to create DB directory")?;
 
@@ -146,7 +146,7 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
 
         for mem_id in memtables_to_flush {
             if let Some(mem) = imm_memtables.get(&mem_id) {
-                flush_tx.blocking_send(mem.clone())?;
+                flush_tx.send(mem.clone()).await?;
             }
         }
 
@@ -616,12 +616,12 @@ mod tests {
     use crate::memtable::BtreeMapMemtable;
     use tempfile::tempdir;
 
-    type Storage = LSMStorage<BtreeMapMemtable>;
-
     #[tokio::test]
     async fn test_basic_crud() -> Result<()> {
         let dir = tempdir()?;
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
 
         let expected = Bytes::from("val1");
         let key = b"key";
@@ -642,13 +642,17 @@ mod tests {
     async fn test_persistence() -> Result<()> {
         let dir = tempdir()?;
 
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
         let key = b"key";
         let expected = Bytes::from("data");
         storage.insert(&key, expected.clone()).await?;
         storage.close().await?;
 
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
         let actual = storage.get(&key).await?;
         assert_eq!(actual, Some(expected));
         Ok(())
@@ -657,20 +661,19 @@ mod tests {
     #[tokio::test]
     async fn test_flush_recovery() -> Result<()> {
         let dir = tempdir()?;
-        let storage = Storage::open(
-            &dir,
-            LSMStorageOptions {
-                memtables_size: 1,
-                ..Default::default()
-            },
-        )?;
+        let storage = LSMStorageOptions::default()
+            .memtable_size(1)
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
 
         let key = b"key";
         let expected = Bytes::from("data");
         storage.insert(key.clone(), expected.clone()).await?;
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait for flush
         storage.close().await?;
-        let storage = Storage::open(&dir, LSMStorageOptions::default())?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
         let actual = storage.get(key).await?;
         assert_eq!(actual, Some(expected));
         Ok(())
@@ -681,7 +684,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = LSMStorageOptions::default()
             .max_l0_ssts(2)
-            .open::<BtreeMapMemtable>(&dir)?;
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
 
         storage.insert(b"a", Bytes::from("1")).await.unwrap();
         storage.insert(b"b", Bytes::from("1")).await.unwrap();

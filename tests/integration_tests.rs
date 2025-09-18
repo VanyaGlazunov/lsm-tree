@@ -1,202 +1,287 @@
-use anyhow::Result;
-use bytes::Bytes;
-use lsm_tree::memtable::BtreeMapMemtable;
-use lsm_tree::options::LSMStorageOptions;
-use std::result::Result::Ok;
-use std::sync::Arc;
-use tempfile::tempdir;
-use tokio::sync::Barrier;
+#[macro_export]
+macro_rules! generate_integration_tests {
+    ($memtable:ty) => {
+        use anyhow::Result;
+        use bytes::Bytes;
+        use lsm_tree::options::LSMStorageOptions;
+        use std::result::Result::Ok;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tempfile::tempdir;
+        use tokio::sync::Barrier;
 
-#[tokio::test]
-async fn test_sstable_priority() -> Result<()> {
-    let dir = tempdir()?;
-    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
-    let key = b"key";
+        #[tokio::test]
+        async fn test_wal_recovery_after_crash() -> Result<()> {
+            let dir = tempdir()?;
+            let path = dir.path().to_path_buf();
 
-    let old = Bytes::from("old");
-    let new = Bytes::from("new");
-    storage.insert(key, old).await?;
-    storage.close().await?;
+            {
+                let options = LSMStorageOptions::default();
+                let storage = options.open::<$memtable>(&path).await?;
 
-    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
-    storage.insert(key, new.clone()).await?;
-    storage.close().await?;
+                storage
+                    .insert(b"key_wal_1", Bytes::from("value_recovered_1"))
+                    .await?;
+                storage
+                    .insert(b"key_wal_2", Bytes::from("value_recovered_2"))
+                    .await?;
+                storage.delete(&b"key_to_delete").await?;
+                storage
+                    .insert(b"key_to_delete", Bytes::from("should_not_exist"))
+                    .await?;
+                storage.delete(&b"key_to_delete").await?;
 
-    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
-    let actual = storage.get(key).await?;
-    assert_eq!(actual, Some(new));
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_concurrent_write_non_overlapping_keys() -> Result<()> {
-    let dir = tempdir()?;
-
-    let storage = Arc::new(
-        LSMStorageOptions::default()
-            .memtable_size(100)
-            .open::<BtreeMapMemtable>(&dir)?,
-    );
-
-    let num_tasks = num_cpus::get();
-    let barrier = Arc::new(Barrier::new(num_tasks));
-    let mut handles = Vec::with_capacity(num_tasks);
-    for i in 0..num_tasks {
-        let storage = storage.clone();
-        let barrier = barrier.clone();
-        handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            for j in 0..100 {
-                let key = format!("key-{i}-{j}");
-                let val = Bytes::from_owner(format!("value-{i}-{j}"));
-                storage.insert(&key, val).await.unwrap();
+                std::mem::forget(storage);
             }
-        }));
-    }
 
-    for handle in handles {
-        handle.await?;
-    }
+            let options = LSMStorageOptions::default();
+            let storage = options.open::<$memtable>(&path).await?;
 
-    for i in 0..num_tasks {
-        for j in 0..100 {
-            let key = format!("key-{i}-{j}").into_bytes();
-            let expected = Bytes::from_owner(format!("value-{i}-{j}"));
+            assert_eq!(
+                storage.get(&b"key_wal_1").await?,
+                Some(Bytes::from("value_recovered_1"))
+            );
+            assert_eq!(
+                storage.get(&b"key_wal_2").await?,
+                Some(Bytes::from("value_recovered_2"))
+            );
+            assert_eq!(
+                storage.get(&b"key_to_delete").await?,
+                None,
+                "Key should be deleted"
+            );
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_compaction_is_triggered_and_succeeds() -> Result<()> {
+            let dir = tempdir()?;
+            let options = LSMStorageOptions::default().max_l0_ssts(2);
+            let storage = options.open::<$memtable>(&dir).await?;
+
+            storage.insert(b"a", Bytes::from("1")).await?;
+            storage.insert(b"b", Bytes::from("2")).await?;
+            storage.force_flush().await?;
+
+            storage.insert(b"c", Bytes::from("3")).await?;
+            storage.insert(b"d", Bytes::from("4")).await?;
+            storage.force_flush().await?;
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            assert_eq!(storage.get(&b"a").await?, Some(Bytes::from("1")));
+            assert_eq!(storage.get(&b"b").await?, Some(Bytes::from("2")));
+            assert_eq!(storage.get(&b"c").await?, Some(Bytes::from("3")));
+            assert_eq!(storage.get(&b"d").await?, Some(Bytes::from("4")));
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_sstable_priority() -> Result<()> {
+            let dir = tempdir()?;
+            let storage = LSMStorageOptions::default().open::<$memtable>(&dir).await?;
+            let key = b"key";
+
+            let old = Bytes::from("old");
+            let new = Bytes::from("new");
+            storage.insert(key, old).await?;
+            storage.close().await?;
+
+            let storage = LSMStorageOptions::default().open::<$memtable>(&dir).await?;
+            storage.insert(key, new.clone()).await?;
+            storage.close().await?;
+
+            let storage = LSMStorageOptions::default().open::<$memtable>(&dir).await?;
+            let actual = storage.get(key).await?;
+            assert_eq!(actual, Some(new));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_write_non_overlapping_keys() -> Result<()> {
+            let dir = tempdir()?;
+
+            let storage = Arc::new(
+                LSMStorageOptions::default()
+                    .memtable_size(100)
+                    .open::<$memtable>(&dir)
+                    .await?,
+            );
+
+            let num_tasks = num_cpus::get();
+            let barrier = Arc::new(Barrier::new(num_tasks));
+            let mut handles = Vec::with_capacity(num_tasks);
+            for i in 0..num_tasks {
+                let storage = storage.clone();
+                let barrier = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    for j in 0..100 {
+                        let key = format!("key-{i}-{j}");
+                        let val = Bytes::from_owner(format!("value-{i}-{j}"));
+                        storage.insert(&key, val).await.unwrap();
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.await?;
+            }
+
+            for i in 0..num_tasks {
+                for j in 0..100 {
+                    let key = format!("key-{i}-{j}").into_bytes();
+                    let expected = Bytes::from_owner(format!("value-{i}-{j}"));
+                    let actual = storage.get(&key).await?;
+                    assert_eq!(actual, Some(expected));
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_read_non_overlapping_keys() -> Result<()> {
+            let dir = tempdir()?;
+
+            let storage = Arc::new(
+                LSMStorageOptions::default()
+                    .memtable_size(100)
+                    .open::<$memtable>(&dir)
+                    .await?,
+            );
+
+            let num_tasks = num_cpus::get();
+
+            for i in 0..num_tasks {
+                for j in 0..100 {
+                    let key = format!("key-{i}-{j}");
+                    let val = Bytes::from_owner(format!("value-{i}-{j}"));
+                    storage.insert(&key, val).await?;
+                }
+            }
+
+            let barrier = Arc::new(Barrier::new(num_tasks));
+            let mut handles = Vec::with_capacity(num_tasks);
+            for i in 0..num_tasks {
+                let storage = storage.clone();
+                let barrier = barrier.clone();
+
+                handles.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    for j in 0..100 {
+                        let key = format!("key-{i}-{j}").into_bytes();
+                        let expected = Bytes::from_owner(format!("value-{i}-{j}"));
+                        let actual = storage.get(&key).await.unwrap();
+
+                        assert_eq!(actual, Some(expected));
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.await?;
+            }
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_large_value() -> Result<()> {
+            let dir = tempdir()?;
+            let storage = LSMStorageOptions::default().open::<$memtable>(&dir).await?;
+
+            let expected = Bytes::from_owner(vec![1u8; 1 << 28]); // 256 mb
+            let key = b"key";
+            storage.insert(&key, expected.clone()).await?;
+            let actual = storage.get(&key).await?;
+            assert_eq!(actual, Some(expected.clone()));
+
+            storage.close().await?;
+            let storage = LSMStorageOptions::default().open::<$memtable>(&dir).await?;
             let actual = storage.get(&key).await?;
             assert_eq!(actual, Some(expected));
+
+            Ok(())
         }
-    }
-    Ok(())
-}
 
-#[tokio::test]
-async fn test_concurrent_read_non_overlapping_keys() -> Result<()> {
-    let dir = tempdir()?;
+        #[tokio::test]
+        async fn test_repeat_same_key() -> Result<()> {
+            let dir = tempdir()?;
 
-    let storage = Arc::new(
-        LSMStorageOptions::default()
-            .memtable_size(100)
-            .open::<BtreeMapMemtable>(&dir)?,
-    );
+            let storage = LSMStorageOptions::default()
+                .memtable_size(1)
+                .open::<$memtable>(&dir)
+                .await?;
 
-    let num_tasks = num_cpus::get();
-
-    for i in 0..num_tasks {
-        for j in 0..100 {
-            let key = format!("key-{i}-{j}");
-            let val = Bytes::from_owner(format!("value-{i}-{j}"));
-            storage.insert(&key, val).await?;
-        }
-    }
-
-    let barrier = Arc::new(Barrier::new(num_tasks));
-    let mut handles = Vec::with_capacity(num_tasks);
-    for i in 0..num_tasks {
-        let storage = storage.clone();
-        let barrier = barrier.clone();
-
-        handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            for j in 0..100 {
-                let key = format!("key-{i}-{j}").into_bytes();
-                let expected = Bytes::from_owner(format!("value-{i}-{j}"));
-                let actual = storage.get(&key).await.unwrap();
-
-                assert_eq!(actual, Some(expected));
+            let key = b"key";
+            for i in 0..100 {
+                storage.insert(&key, Bytes::from(i.to_string())).await?;
             }
-        }));
-    }
 
-    for handle in handles {
-        handle.await?;
-    }
+            let actual = storage.get(&key).await?;
+            let expected = Some(Bytes::from("99"));
+            assert_eq!(actual, expected);
 
-    Ok(())
+            storage.delete(&key).await?;
+
+            storage.close().await?;
+            let storage = LSMStorageOptions::default()
+                .memtable_size(1)
+                .open::<$memtable>(&dir)
+                .await?;
+
+            storage.delete(&key).await?;
+            let actual = storage.get(&key).await?;
+            assert_eq!(actual, None);
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_flush_race_conditions() -> Result<()> {
+            let dir = tempdir()?;
+
+            let options = LSMStorageOptions::default()
+                .memtable_size(1)
+                .num_flush_jobs(2);
+
+            let storage = options.clone().open::<$memtable>(&dir).await?;
+
+            let expected = Bytes::from("value");
+            for i in 0..100 {
+                storage
+                    .insert(format!("key-{}", i).as_bytes(), expected.clone())
+                    .await?;
+            }
+
+            for i in 0..100 {
+                let key = format!("key-{}", i).into_bytes();
+                let actual = storage.get(&key).await?;
+                assert_eq!(actual, Some(expected.clone()));
+            }
+
+            storage.close().await?;
+
+            let storage = options.open::<$memtable>(&dir).await?;
+            for i in 0..100 {
+                let key = format!("key-{}", i).into_bytes();
+                let actual = storage.get(&key).await?;
+                assert_eq!(actual, Some(expected.clone()));
+            }
+
+            Ok(())
+        }
+    };
 }
 
-#[tokio::test]
-async fn test_large_value() -> Result<()> {
-    let dir = tempdir()?;
-    let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
-
-    // let expected = Bytes::from_owner(vec![1u8; 1 << 28]); // 256 mb
-    let expected = Bytes::from_owner(vec![1u8; 1 << 23]);
-    let key = b"key";
-    storage.insert(&key, expected.clone()).await?;
-    let actual = storage.get(&key).await?;
-    assert_eq!(actual, Some(expected.clone()));
-
-    // storage.close().await?;
-    // let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>(&dir)?;
-    // let actual = storage.get(&key).await?;
-    // assert_eq!(actual, Some(expected));
-
-    Ok(())
+mod btree_tests {
+    use lsm_tree::memtable::BtreeMapMemtable;
+    generate_integration_tests!(BtreeMapMemtable);
 }
 
-#[tokio::test]
-async fn test_repeat_same_key() -> Result<()> {
-    let dir = tempdir()?;
-
-    let storage = LSMStorageOptions::default()
-        .memtable_size(1)
-        .open::<BtreeMapMemtable>(&dir)?;
-
-    let key = b"key";
-    for i in 0..100 {
-        storage.insert(&key, Bytes::from(i.to_string())).await?;
-    }
-
-    let actual = storage.get(&key).await?;
-    let expected = Some(Bytes::from("99"));
-    assert_eq!(actual, expected);
-
-    storage.delete(&key).await?;
-
-    storage.close().await?;
-    let storage = LSMStorageOptions::default()
-        .memtable_size(1)
-        .open::<BtreeMapMemtable>(&dir)?;
-
-    storage.delete(&key).await?;
-    let actual = storage.get(&key).await?;
-    assert_eq!(actual, None);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_flush_race_conditions() -> Result<()> {
-    let dir = tempdir()?;
-
-    let options = LSMStorageOptions::default()
-        .memtable_size(1)
-        .num_flush_jobs(2);
-
-    let storage = options.clone().open::<BtreeMapMemtable>(&dir)?;
-
-    let expected = Bytes::from("value");
-    for i in 0..100 {
-        storage
-            .insert(format!("key-{}", i).as_bytes(), expected.clone())
-            .await?;
-    }
-
-    for i in 0..100 {
-        let key = format!("key-{}", i).into_bytes();
-        let actual = storage.get(&key).await?;
-        assert_eq!(actual, Some(expected.clone()));
-    }
-
-    storage.close().await?;
-
-    // Verify persistence after forced flushes
-    let storage = options.open::<BtreeMapMemtable>(&dir)?;
-    for i in 0..100 {
-        let key = format!("key-{}", i).into_bytes();
-        let actual = storage.get(&key).await?;
-        assert_eq!(actual, Some(expected.clone()));
-    }
-
-    Ok(())
+mod skiplist_tests {
+    use lsm_tree::memtable::SkipListMemtable;
+    generate_integration_tests!(SkipListMemtable);
 }

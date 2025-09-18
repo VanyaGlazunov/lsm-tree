@@ -28,7 +28,7 @@ pub trait Memtable {
 }
 
 /// Memtable implementation based on [BTreeMap]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BtreeMapMemtable {
     id: usize,
     size: usize,
@@ -67,6 +67,7 @@ impl Memtable for BtreeMapMemtable {
 }
 
 /// Memtable implementation based on [SkipMap]
+#[derive(Debug)]
 pub struct SkipListMemtable {
     id: usize,
     size: AtomicUsize,

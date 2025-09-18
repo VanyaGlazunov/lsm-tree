@@ -2,7 +2,9 @@ pub(crate) mod builder;
 
 use bincode::{
     config::{Config, Configuration, Fixint, LittleEndian, NoLimit},
-    decode_from_slice, encode_to_vec, Decode, Encode,
+    decode_from_slice, encode_to_vec,
+    error::DecodeError,
+    Decode, Encode,
 };
 use builder::BlockEntry;
 use bytes::Bytes;
@@ -39,8 +41,8 @@ impl Block {
     ///
     /// #Panics
     /// - May panic if the block is corrupted/invalid. To prevent this use [builder::BlockBuilder] to build blocks.
-    pub fn decode(buf: &[u8]) -> Self {
-        decode_from_slice(buf, bincode_config()).unwrap().0
+    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        decode_from_slice(buf, bincode_config()).map(|(block, _)| block)
     }
 }
 
@@ -95,7 +97,7 @@ mod tests {
         assert!(block.entries.is_empty());
 
         let encoded = block.encode();
-        let decoded = Block::decode(&encoded);
+        let decoded = Block::decode(&encoded).unwrap();
         assert!(decoded.entries.is_empty());
     }
 
@@ -106,7 +108,7 @@ mod tests {
 
         let block = builder.build();
         let encoded = block.encode();
-        let decoded = Block::decode(&encoded);
+        let decoded = Block::decode(&encoded).unwrap();
 
         let mut iter = decoded.iter();
         assert_eq!(
@@ -140,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_block_boundary() {
-        let mut builder = BlockBuilder::new(54); // 3 entries will fill exactly 54 bytes
+        let mut builder = BlockBuilder::new(54);
         assert!(builder.add(Bytes::from("k1"), Record::put_from_slice("val1")));
         assert!(builder.add(Bytes::from("k2"), Record::put_from_slice("val2")));
 
@@ -185,7 +187,7 @@ mod tests {
     #[test]
     fn test_corrupted_data() {
         let invalid_data = vec![0u8; 10];
-        let decoded = Block::decode(&invalid_data);
+        let decoded = Block::decode(&invalid_data).unwrap();
         assert!(decoded.entries.is_empty());
     }
 
@@ -209,6 +211,24 @@ mod tests {
         let block = builder.build();
         let mut iter = block.iter();
         assert_eq!(iter.next(), Some((binary_key, binary_val)));
+    }
+
+    #[test]
+    fn test_builder_allows_first_entry_larger_than_block_size() {
+        let mut builder = BlockBuilder::new(20);
+        let large_key = Bytes::from("this_key_is_definitely_too_long");
+        let large_value = Record::put_from_slice("and_this_value_is_also_too_long");
+
+        assert!(builder.add(large_key.clone(), large_value.clone()));
+        assert!(!builder.is_empty());
+
+        assert!(!builder.add(Bytes::from("k2"), Record::put_from_slice("v2")));
+
+        let block = builder.build();
+        assert_eq!(block.entries.len(), 1);
+        let mut iter = block.iter();
+        assert_eq!(iter.next(), Some((large_key, large_value)));
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
