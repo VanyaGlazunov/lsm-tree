@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{create_dir_all, remove_file},
-    mem::replace,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -10,10 +9,11 @@ use std::{
 };
 
 use anyhow::{Context, Error, Result};
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use tokio::{
     self,
-    sync::{mpsc, oneshot, watch, Mutex, RwLock, RwLockWriteGuard},
+    sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
 };
 
@@ -41,9 +41,7 @@ pub(crate) async fn memtable_to_sst(
     memtable: &impl Memtable,
 ) -> Result<SSTable> {
     let mut builder = SSTableBuilder::new(block_size);
-    for (key, value) in memtable.iter() {
-        builder.add(key, value);
-    }
+    memtable.write_to_sst(&mut builder);
 
     let id = memtable.get_id();
     builder
@@ -78,23 +76,33 @@ impl Record {
     }
 }
 
-pub(crate) struct StateSnapshot<M: Memtable + Send + Sync + 'static> {
+pub(crate) struct StateSnapshot<M> {
     pub imm_memtables: Arc<ImmutableMemtableMap<M>>,
     pub levels: Arc<Levels>,
     pub sstables: Arc<SSTableMap>,
 }
 
-pub(crate) struct StateWriterContext<M: Memtable + Send + Sync + 'static> {
+impl<M> Clone for StateSnapshot<M> {
+    fn clone(&self) -> Self {
+        Self {
+            imm_memtables: self.imm_memtables.clone(),
+            levels: self.levels.clone(),
+            sstables: self.sstables.clone(),
+        }
+    }
+}
+
+pub(crate) struct StateWriterContext<M> {
     pub manifest: Mutex<Manifest>,
     pub snapshot_sender: watch::Sender<StateSnapshot<M>>,
 }
 
 /// Main storage engine.
-pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
+pub struct LSMStorage<M> {
     path: PathBuf,
     next_sst_id: Arc<AtomicUsize>,
-    swap_lock: Mutex<()>,
-    memtable: RwLock<M>,
+    flush_lock: Mutex<()>,
+    memtable: ArcSwap<M>,
     state_snapshot_receiver: watch::Receiver<StateSnapshot<M>>,
     state_update_sender: mpsc::Sender<StateUpdateEvent<M>>,
     state_update_handle: JoinHandle<()>,
@@ -105,7 +113,7 @@ pub struct LSMStorage<M: Memtable + Send + Sync + 'static> {
 }
 
 #[derive(Debug)]
-pub(crate) enum StateUpdateEvent<M: Memtable> {
+pub(crate) enum StateUpdateEvent<M> {
     FlushComplete(usize, SSTable),
     FlushFail(Error),
     CompactionComplete(CompactionResult),
@@ -114,14 +122,14 @@ pub(crate) enum StateUpdateEvent<M: Memtable> {
     Close(usize),
 }
 
-impl<M: Memtable + Send + Sync> LSMStorage<M> {
+impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
     /// Opens/Creates storage in path given.
     pub async fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         create_dir_all(path).context("Failed to create DB directory")?;
 
         let manifest_path = path.join("MANIFEST");
-        let (manifest, records) = if manifest_path.exists() {
+        let (mut manifest, records) = if manifest_path.exists() {
             Manifest::recover(manifest_path)?
         } else {
             (Manifest::new(manifest_path)?, Vec::new())
@@ -187,8 +195,8 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
             path: path.to_path_buf(),
             next_sst_id,
             state_update_sender,
-            swap_lock: Mutex::new(()),
-            memtable: memtable.into(),
+            flush_lock: Mutex::new(()),
+            memtable: Arc::new(memtable).into(),
             state_snapshot_receiver: snapshot_rx,
             state_update_handle,
             flush_sender: flush_tx,
@@ -208,6 +216,7 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                 while let Some(result) = state_update_receiver.recv().await {
                     match result {
                         StateUpdateEvent::FlushComplete(id, sst) => {
+                            // continue;
                             context
                                 .manifest
                                 .lock()
@@ -215,26 +224,21 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                                 .add_record(ManifestRecord::Flush(id))
                                 .unwrap();
 
-                            let (mut imm_memtables, mut sstables, mut levels) = {
-                                let snapshot = context.snapshot_sender.borrow();
-                                (
-                                    (*snapshot.imm_memtables).clone(),
-                                    (*snapshot.sstables).clone(),
-                                    (*snapshot.levels).clone(),
-                                )
-                            };
+                            let mut snapshot = context.snapshot_sender.borrow().clone();
+                            let mut sstables = (*snapshot.sstables).clone();
+                            let mut levels = (*snapshot.levels).clone();
+                            let mut imm_memtables = (*snapshot.imm_memtables).clone();
 
                             sstables.insert(id, sst.into());
                             levels[0].push(id);
+                            levels[0].sort_unstable();
                             imm_memtables.remove(&id);
 
-                            let new_snapshot = StateSnapshot {
-                                levels: levels.into(),
-                                imm_memtables: imm_memtables.into(),
-                                sstables: sstables.into(),
-                            };
+                            snapshot.sstables = sstables.into();
+                            snapshot.levels = levels.into();
+                            snapshot.imm_memtables = imm_memtables.into();
 
-                            context.snapshot_sender.send(new_snapshot).unwrap();
+                            context.snapshot_sender.send(snapshot).unwrap();
 
                             let wal_path = Wal::get_wal_path(&path, id);
                             if let Err(e) = remove_file(&wal_path) {
@@ -266,14 +270,9 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                                 .add_record(manifest_record)
                                 .unwrap();
 
-                            let (imm_memtables, mut sstables, mut levels) = {
-                                let snapshot = context.snapshot_sender.borrow();
-                                (
-                                    snapshot.imm_memtables.clone(),
-                                    (*snapshot.sstables).clone(),
-                                    (*snapshot.levels).clone(),
-                                )
-                            };
+                            let mut snapshot = context.snapshot_sender.borrow().clone();
+                            let mut sstables = (*snapshot.sstables).clone();
+                            let mut levels = (*snapshot.levels).clone();
 
                             for level in &mut levels {
                                 level.retain(|id| !old_ids.contains(id));
@@ -295,13 +294,10 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                                 sstables.get(id).map_or(Bytes::new(), |sst| sst.first_key())
                             });
 
-                            let new_snapshot = StateSnapshot {
-                                levels: levels.into(),
-                                imm_memtables,
-                                sstables: sstables.into(),
-                            };
+                            snapshot.sstables = sstables.into();
+                            snapshot.levels = levels.into();
 
-                            context.snapshot_sender.send(new_snapshot).unwrap();
+                            context.snapshot_sender.send(snapshot).unwrap();
                         }
                         StateUpdateEvent::CompactionFailed(e) => {
                             eprintln!("Error during compaction: {}", e)
@@ -317,21 +313,11 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                                     .unwrap();
                             }
 
-                            let (mut imm_memtables, sstables, levels) = {
-                                let snapshot = context.snapshot_sender.borrow();
-                                (
-                                    (*snapshot.imm_memtables).clone(),
-                                    snapshot.sstables.clone(),
-                                    snapshot.levels.clone(),
-                                )
-                            };
+                            let mut snapshot = context.snapshot_sender.borrow().clone();
+                            let mut imm_memtables = (*snapshot.imm_memtables).clone();
                             imm_memtables.insert(old_memtable.get_id(), old_memtable);
-                            let new_snapshot = StateSnapshot {
-                                imm_memtables: imm_memtables.into(),
-                                sstables,
-                                levels,
-                            };
-                            context.snapshot_sender.send(new_snapshot).unwrap();
+                            snapshot.imm_memtables = imm_memtables.into();
+                            context.snapshot_sender.send(snapshot).unwrap();
 
                             ack.send(()).unwrap();
                         }
@@ -432,7 +418,7 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
                     continue;
                 }
 
-                let mut memtable = M::new(id);
+                let memtable = M::new(id);
                 let records: Result<Vec<_>, _> = Wal::open(entry_path, false)?.iter().collect();
                 let records = records?;
                 for (key, value) in records {
@@ -455,7 +441,7 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
     pub async fn close(self) -> Result<()> {
         let memtable = self.memtable.into_inner();
         if memtable.size_estimate() > 0 {
-            memtable_to_sst(self.options.block_size, &self.path, &memtable).await?;
+            memtable_to_sst(self.options.block_size, &self.path, &*memtable).await?;
             self.state_update_sender
                 .send(StateUpdateEvent::Close(memtable.get_id()))
                 .await?;
@@ -480,8 +466,9 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
 
     /// Retrieves value for key.
     pub async fn get(&self, key: &impl AsRef<[u8]>) -> Result<Option<Bytes>> {
-        let memtable = self.memtable.read().await;
+        let snapshot = self.state_snapshot_receiver.borrow().clone();
         let key = key.as_ref();
+        let memtable = self.memtable.load();
 
         if let Some(rec) = memtable.get(key) {
             return Ok(rec.into_inner());
@@ -489,24 +476,15 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
 
         drop(memtable);
 
-        let (imm_memtables, sstables, levels) = {
-            let snapshot = self.state_snapshot_receiver.borrow();
-            (
-                snapshot.imm_memtables.clone(),
-                snapshot.sstables.clone(),
-                snapshot.levels.clone(),
-            )
-        };
-
-        for imm_memtable in imm_memtables.values().rev() {
+        for imm_memtable in snapshot.imm_memtables.values().rev() {
             if let Some(rec) = imm_memtable.get(key) {
                 return Ok(rec.into_inner());
             }
         }
 
-        if let Some(level0) = levels.first() {
+        if let Some(level0) = snapshot.levels.first() {
             for sst_id in level0.iter().rev() {
-                if let Some(sst) = sstables.get(sst_id) {
+                if let Some(sst) = snapshot.sstables.get(sst_id) {
                     if let Some(rec) = sst.get(key)? {
                         return Ok(rec.into_inner());
                     }
@@ -514,20 +492,18 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
             }
         }
 
-        for level in levels.iter().skip(1) {
+        for level in snapshot.levels.iter().skip(1) {
             for sst_id in level {
-                if let Some(sst) = sstables.get(sst_id) {
+                if let Some(sst) = snapshot.sstables.get(sst_id) {
                     if key >= sst.first_key().as_ref() && key <= sst.last_key().as_ref() {
                         if let Some(rec) = sst.get(key)? {
                             return Ok(rec.into_inner());
-                        } else {
-                            return Ok(None);
                         }
+                        break;
                     }
                 }
             }
         }
-
         Ok(None)
     }
 
@@ -550,13 +526,18 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
             wal.append(key.clone(), &value)?;
         }
 
-        let mut memtable = self.memtable.write().await;
+        let memtable = self.memtable.load();
         memtable.set(key, value.clone());
 
         if memtable.size_estimate() > self.options.memtables_size {
-            self.flush(memtable)
-                .await
-                .context("Failed to start flushing")?;
+            let lock = self.flush_lock.try_lock();
+
+            if lock.is_ok() {
+                let current_memtable = self.memtable.load();
+                if Arc::ptr_eq(&memtable, &current_memtable) {
+                    self.flush().await.context("Failed to start flushing")?;
+                }
+            }
         }
 
         Ok(())
@@ -564,29 +545,28 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
 
     /// Forces flush of current memtable.
     pub async fn force_flush(&self) -> Result<()> {
-        let memtable = self.memtable.write().await;
-        self.flush(memtable).await
+        let lock = self.flush_lock.try_lock();
+        let memtable = self.memtable.load();
+        if lock.is_ok() {
+            let current_memtable = self.memtable.load();
+            if Arc::ptr_eq(&memtable, &current_memtable) {
+                return self.flush().await;
+            }
+        }
+
+        Ok(())
     }
 
-    async fn flush(&self, mut memtable: RwLockWriteGuard<'_, M>) -> Result<()> {
+    async fn flush(&self) -> Result<()> {
         let new_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
 
         let new_memtable = M::new(new_id);
         let new_wal_path = Wal::get_wal_path(&self.path, new_id);
         let new_wal = Wal::open(new_wal_path, self.options.durable_wal)?;
 
-        let old_memtable;
-        {
-            let _lock = self.swap_lock.lock().await;
-            old_memtable = replace(&mut *memtable, new_memtable);
-            let mut current_wal = self.wal.lock().await;
-            *current_wal = new_wal;
-        };
-        drop(memtable);
+        let old_memtable = self.memtable.load_full();
 
-        let old_memtable = Arc::new(old_memtable);
         let (ack_tx, ack_rx) = oneshot::channel();
-
         self.state_update_sender
             .send(StateUpdateEvent::NewMemtable(
                 old_memtable.clone(),
@@ -595,14 +575,20 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
             ))
             .await?;
 
+        ack_rx
+            .await
+            .context("State update task failed to acknowledge memtable swap")?;
+
+        {
+            let mut current_wal = self.wal.lock().await;
+            *current_wal = new_wal;
+        };
+        self.memtable.store(new_memtable.into());
+
         self.flush_sender
             .send(old_memtable)
             .await
             .context("Failed to send memtable into flush channel")?;
-
-        ack_rx
-            .await
-            .context("State update task failed to acknowledge memtable swap")?;
 
         Ok(())
     }

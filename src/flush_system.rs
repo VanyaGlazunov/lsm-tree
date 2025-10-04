@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::lsm_storage::{memtable_to_sst, LSMStorage, StateUpdateEvent};
 use crate::memtable::Memtable;
 
-impl<M: Memtable + Send + Sync> LSMStorage<M> {
+impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
     pub(crate) fn start_flush_workers(
         path: PathBuf,
         num_jobs: usize,

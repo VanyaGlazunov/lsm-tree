@@ -89,7 +89,7 @@ impl LeveledCompactionStrategy {
     }
 }
 
-impl<M: Memtable + Send + Sync> LSMStorage<M> {
+impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
     pub(crate) fn start_compaction_worker(
         path: PathBuf,
         options: LSMStorageOptions,
@@ -145,11 +145,13 @@ impl<M: Memtable + Send + Sync> LSMStorage<M> {
         sstables: &SSTableMap,
     ) -> Result<CompactionResult> {
         let mut iters = Vec::new();
-        for id in task
-            .source_level_ssts
-            .iter()
-            .chain(task.target_level_ssts.iter())
-        {
+        let mut ids = [
+            task.source_level_ssts.clone(),
+            task.target_level_ssts.clone(),
+        ]
+        .concat();
+        ids.sort();
+        for id in &ids {
             if let Some(sst) = sstables.get(id) {
                 iters.push(SSTableIterator::new(Arc::new(sst.try_clone()?)));
             }

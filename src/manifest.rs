@@ -73,18 +73,18 @@ impl Manifest {
     }
 
     /// Adds record and fsyncs
-    pub fn add_record(&self, record: ManifestRecord) -> Result<()> {
-        let mut file = &self.file;
-
+    pub fn add_record(&mut self, record: ManifestRecord) -> Result<()> {
         let buf = encode_to_vec(record, standard())?;
 
-        file.write_all(&buf.len().to_be_bytes())
+        self.file
+            .write_all(&buf.len().to_be_bytes())
             .context("Failed to wrtie record len to file")?;
 
-        file.write_all(&buf)
+        self.file
+            .write_all(&buf)
             .context("Failed to write record to file")?;
 
-        file.sync_all().context("Failed to sync file")?;
+        self.file.sync_all().context("Failed to sync file")?;
 
         Ok(())
     }
@@ -107,7 +107,7 @@ mod manifest_tests {
     #[test]
     fn test_record_roundtrip() -> Result<()> {
         let file = NamedTempFile::new()?;
-        let manifest = Manifest::new(file.path())?;
+        let mut manifest = Manifest::new(file.path())?;
 
         manifest.add_record(ManifestRecord::NewMemtable(1))?;
         manifest.add_record(ManifestRecord::Flush(1))?;

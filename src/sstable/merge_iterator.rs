@@ -3,6 +3,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use std::{cmp::Ordering, collections::BinaryHeap};
 
+#[derive(Debug)]
 struct HeapItem {
     item: (Bytes, Record),
     iterator_idx: usize,
@@ -59,6 +60,14 @@ impl Iterator for MergeIterator {
         loop {
             let top_item = self.heap.pop()?;
 
+            let source_idx = top_item.iterator_idx;
+            if let Some(next_item) = self.iters[source_idx].next() {
+                self.heap.push(HeapItem {
+                    item: next_item,
+                    iterator_idx: source_idx,
+                });
+            }
+
             while let Some(peeked_item) = self.heap.peek() {
                 if peeked_item.item.0 == top_item.item.0 {
                     let duplicate = self.heap.pop().unwrap();
@@ -73,19 +82,9 @@ impl Iterator for MergeIterator {
                 }
             }
 
-            let source_idx = top_item.iterator_idx;
-            if let Some(next_item) = self.iters[source_idx].next() {
-                self.heap.push(HeapItem {
-                    item: next_item,
-                    iterator_idx: source_idx,
-                });
+            if top_item.item.1 != Record::Delete {
+                return Some(top_item.item);
             }
-
-            if top_item.item.1 == Record::Delete {
-                continue;
-            }
-
-            return Some(top_item.item);
         }
     }
 }

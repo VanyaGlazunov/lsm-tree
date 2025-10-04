@@ -74,8 +74,8 @@ impl SSTable {
     /// Opens existing SSTable
     ///
     /// #Errors
-    /// - Returns error if can not open SSTable file
-    /// - Returns error if can not decode SSTable file  
+    /// - Returns error if unable to open SSTable file
+    /// - Returns error if unable to decode SSTable file  
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
