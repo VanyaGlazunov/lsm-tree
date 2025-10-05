@@ -2,8 +2,7 @@ pub(crate) mod builder;
 pub(crate) mod merge_iterator;
 
 use std::{
-    fs::{File, OpenOptions},
-    os::unix::fs::FileExt,
+    fs::File,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,25 +14,50 @@ use crate::{
 use anyhow::{Context, Result};
 use bloomfilter::Bloom;
 use bytes::{Buf, Bytes};
+use memmap2::Mmap;
 
 const OFFSET_SIZE: usize = std::mem::size_of::<u32>();
 
-#[derive(Debug)]
+/// Metadata about a single block within an SSTable.
+///
+/// Contains the file offset and key range to enable efficient lookups.
+#[derive(Debug, Clone)]
 pub struct BlockMeta {
     offset: usize,
     first_key: Bytes,
     last_key: Bytes,
 }
 
-/// On-disk sorted key-value data.
-#[derive(Debug)]
+/// Immutable sorted string table stored on disk.
+///
+/// An SSTable is a sorted, immutable collection of key-value pairs organized
+/// into fixed-size blocks. It uses memory-mapped I/O for efficient random access
+/// and includes a Bloom filter to avoid unnecessary disk I/O for non-existent keys.
+///
+/// # Thread Safety
+///
+/// SSTable is immutable after creation, making it safe to share across threads.
+/// The internal `Arc` references enable lock-free concurrent reads.
 pub struct SSTable {
-    path: PathBuf,            // underlying file
-    meta: Vec<BlockMeta>,     // Blocks' meta data
-    meta_block_offset: usize, // Offset of meta block in file
-    bloom: Bloom<[u8]>,       // Bloom filter to speed up lookups
-    first_key: Bytes,         // First key in SSTable
-    last_key: Bytes,          // Last key in SSTable
+    path: PathBuf,                   // underlying file path
+    mmap: Arc<Mmap>,                 // Memory-mapped file (no I/O after initial mmap!)
+    pub(crate) meta: Vec<BlockMeta>, // Blocks' meta data
+    meta_block_offset: usize,        // Offset of meta block in file
+    bloom: Bloom<[u8]>,              // Bloom filter to speed up lookups (Arc for cheap cloning)
+    first_key: Bytes,                // First key in SSTable
+    last_key: Bytes,                 // Last key in SSTable
+}
+
+impl std::fmt::Debug for SSTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SSTable")
+            .field("path", &self.path)
+            .field("meta_len", &self.meta.len())
+            .field("meta_block_offset", &self.meta_block_offset)
+            .field("first_key", &self.first_key)
+            .field("last_key", &self.last_key)
+            .finish()
+    }
 }
 
 fn deserialize_metadata(mut buf: &[u8]) -> Vec<BlockMeta> {
@@ -71,36 +95,46 @@ impl SSTable {
         path.as_ref().to_path_buf().join(format!("{id}.sst"))
     }
 
-    /// Opens existing SSTable
+    /// Opens an existing SSTable from disk using memory mapping.
+    /// # Arguments
     ///
-    /// #Errors
-    /// - Returns error if unable to open SSTable file
-    /// - Returns error if unable to decode SSTable file  
+    /// * `path` - Path to the SSTable file (typically `{id}.sst`)
+    ///
+    /// # Returns
+    ///
+    /// A new SSTable instance with the file memory-mapped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - File cannot be opened or is too small
+    /// - Memory mapping fails
+    /// - File format is invalid or corrupted
+    /// - Metadata cannot be decoded
+    ///
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .context("Failed to open sstable file")?;
+        let file = File::open(&path).context("Failed to open sstable file")?;
 
-        let file_size = file.metadata()?.len() as usize;
+        // Memory-map the file for zero-copy access
+        let mmap = unsafe { Mmap::map(&file)? };
+        let file_size = mmap.len();
+
         if file_size < OFFSET_SIZE {
             anyhow::bail!("SSTable file is too small to be valid");
         }
 
-        let mut meta_offset = [0u8; OFFSET_SIZE];
-        file.read_exact_at(&mut meta_offset, (file_size - OFFSET_SIZE) as u64)
-            .context("Failed to read meta offset")?;
+        // Read meta offset from end of mmap (no I/O!)
+        let meta_offset_bytes = &mmap[file_size - OFFSET_SIZE..];
+        let meta_offset = (&meta_offset_bytes[..]).get_u32() as usize;
 
-        let meta_offset = (&meta_offset[..]).get_u32() as usize;
         if meta_offset >= file_size - OFFSET_SIZE {
             anyhow::bail!("Invalid meta offset");
         }
 
+        // Read metadata block from mmap (no I/O!)
         let meta_length = file_size - meta_offset - OFFSET_SIZE;
-        let mut buf = vec![0; meta_length];
-        file.read_exact_at(&mut buf, meta_offset as u64)
-            .context("Failed to read meta")?;
+        let buf = &mmap[meta_offset..meta_offset + meta_length];
 
         let meta_length = (&buf[buf.len() - OFFSET_SIZE..]).get_u32() as usize;
         let meta_bytes = &buf[..meta_length];
@@ -122,6 +156,7 @@ impl SSTable {
 
         Ok(SSTable {
             path,
+            mmap: Arc::new(mmap),
             meta,
             meta_block_offset: meta_offset,
             bloom,
@@ -130,8 +165,17 @@ impl SSTable {
         })
     }
 
-    /// Lookups given key in SSTable
-    pub fn get(&self, key: &[u8]) -> Result<Option<Record>> {
+    /// Looks up a key in the SSTable.
+    /// # Arguments
+    ///
+    /// * `key` - The key to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(record))` - Key found with its record
+    /// * `Ok(None)` - Key definitely not in this SSTable
+    /// * `Err(_)` - Decoding or I/O error
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Record>> {
         if !self.bloom.check(key) {
             return Ok(None);
         }
@@ -144,7 +188,7 @@ impl SSTable {
         }
         let block_ind = partition_point - 1;
 
-        let block = self.read_block(block_ind)?;
+        let block = self.read_block(block_ind).await?;
 
         let mut iter = block.iter();
         iter.seek(key);
@@ -160,26 +204,32 @@ impl SSTable {
         }
     }
 
-    /// Reads block from sstable by index.
-    fn read_block(&self, block_index: usize) -> Result<Block> {
+    /// Reads and decodes a block by index.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_index` - Index of the block to read (0-based)
+    ///
+    /// # Returns
+    ///
+    /// The decoded block containing key-value entries.
+    async fn read_block(&self, block_index: usize) -> Result<Block> {
         let block_offset = self.meta[block_index].offset;
         let end_offset = self
             .meta
             .get(block_index + 1)
             .map_or(self.meta_block_offset, |b| b.offset);
-        let block_len = end_offset - block_offset;
 
-        let mut buf = vec![0; block_len];
-        let file =
-            File::open(&self.path).context(format!("Failed to open SSTable {:?}", self.path))?;
-        file.read_exact_at(&mut buf[..], block_offset as u64)
-            .context("Failed to read block data")?;
+        let mmap = Arc::clone(&self.mmap);
 
-        Block::decode(&buf[..]).context("Failed to decode block")
-    }
-
-    pub fn try_clone(&self) -> Result<Self> {
-        SSTable::open(&self.path)
+        // Decode in spawn_blocking to avoid blocking tokio runtime
+        // The actual memory access is instant, but deserialization can take time
+        tokio::task::spawn_blocking(move || {
+            let block_data = &mmap[block_offset..end_offset];
+            Block::decode(block_data).context("Failed to decode block")
+        })
+        .await
+        .context("Blocking task panicked")?
     }
 }
 
@@ -192,15 +242,9 @@ pub struct SSTableIterator {
 
 impl SSTableIterator {
     pub fn new(sstable: Arc<SSTable>) -> Self {
-        let first_block = if !sstable.meta.is_empty() {
-            sstable.read_block(0).ok()
-        } else {
-            None
-        };
-
         Self {
             sstable,
-            current_block: first_block,
+            current_block: None,
             block_idx: 0,
             entry_idx: 0,
         }
@@ -221,6 +265,14 @@ impl Iterator for SSTableIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if self.current_block.is_none() && self.block_idx < self.sstable.meta.len() {
+                self.current_block = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(self.sstable.read_block(self.block_idx))
+                        .ok()
+                });
+            }
+
             let block = self.current_block.as_ref()?;
 
             if let Some(entry) = block.entries.get(self.entry_idx) {
@@ -234,7 +286,11 @@ impl Iterator for SSTableIterator {
                 return None;
             }
 
-            self.current_block = self.sstable.read_block(self.block_idx).ok();
+            self.current_block = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(self.sstable.read_block(self.block_idx))
+                    .ok()
+            });
             self.entry_idx = 0;
         }
     }
@@ -262,7 +318,7 @@ mod tests {
 
         let sstable = SSTable::open(path)?;
         assert_eq!(
-            sstable.get(b"key1")?,
+            sstable.get(b"key1").await?,
             Some(Record::put_from_slice("value1"))
         );
         assert_eq!(sstable.first_key(), Bytes::from("key1"));
@@ -294,7 +350,7 @@ mod tests {
 
         for key in ["a", "b", "c", "d", "e", "f"] {
             assert_eq!(
-                sstable.get(key.as_bytes())?,
+                sstable.get(key.as_bytes()).await?,
                 Some(Record::put_from_slice(format!("value{}", key)))
             );
         }
@@ -314,8 +370,8 @@ mod tests {
 
         let sstable = SSTable::open(path)?;
 
-        assert_eq!(sstable.get(b"a")?, None);
-        assert_eq!(sstable.get(b"c")?, None);
+        assert_eq!(sstable.get(b"a").await?, None);
+        assert_eq!(sstable.get(b"c").await?, None);
         Ok(())
     }
 
@@ -334,9 +390,12 @@ mod tests {
 
         let sstable = SSTable::open(path)?;
 
-        assert_eq!(sstable.get(b"c")?, None);
-        assert_eq!(sstable.get(b"e")?, None);
-        assert_eq!(sstable.get(b"f")?, Some(Record::put_from_slice("value3")));
+        assert_eq!(sstable.get(b"c").await?, None);
+        assert_eq!(sstable.get(b"e").await?, None);
+        assert_eq!(
+            sstable.get(b"f").await?,
+            Some(Record::put_from_slice("value3"))
+        );
         Ok(())
     }
 
@@ -375,13 +434,13 @@ mod tests {
 
         let sstable = SSTable::open(path)?;
         assert_eq!(
-            sstable.get(b"persist")?,
+            sstable.get(b"persist").await?,
             Some(Record::put_from_slice("data"))
         );
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_sstable_iterator() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();
@@ -417,7 +476,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_sstable_iterator_empty() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path();

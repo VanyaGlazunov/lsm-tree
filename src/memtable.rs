@@ -1,3 +1,10 @@
+//! In-memory buffer implementations for LSM-tree writes.
+//!
+//! Memtables temporarily hold recent writes before being flushed to SSTables.
+//! Two implementations are provided:
+//! - [`BtreeMapMemtable`] - Based on std BTreeMap (uses RwLock)
+//! - [`SkipListMemtable`] - Based on crossbeam SkipMap (lock-free)
+
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicUsize, Ordering},
@@ -9,30 +16,35 @@ use std::sync::RwLock;
 
 use crate::{lsm_storage::Record, sstable::builder::SSTableBuilder};
 
-/// Trait represents in-memmory buffer of Log-Structured Merge Tree.
+/// In-memory buffer for recent writes in an LSM-tree.
+///
+/// Memtables provide fast reads and writes by keeping data in memory.
+/// When a memtable reaches its size limit, it becomes immutable and is flushed
+/// to disk as an SSTable.
 pub trait Memtable {
-    /// Creates new instance with given ID.
-    ///
-    /// [crate::lsm_storage::LSMStorage] associates monotonically increasing ID for each memtable and keeps a number of created memtables.
+    /// Creates a new memtable with the given ID.
     fn new(id: usize) -> Self;
-    /// Returns for given key if it exists, None otherwise.
+
+    /// Retrieves the record for a key, if it exists.
     fn get(&self, key: &[u8]) -> Option<Record>;
-    /// Inserts/Updates key-value pair.
+
+    /// Inserts or updates a key-value pair.
     fn set(&self, key: Bytes, value: Record);
-    /// Returns memtable ID.
+
+    /// Returns the unique ID of this memtable.
     fn get_id(&self) -> usize;
-    /// Estimates the total size of stored data.
+
+    /// Returns an estimate of the total data size in bytes.
     ///
-    /// It is advised to implement it by adding size of keys and values inside [Memtable::set] method.
-    /// Estimations doesn't need to be very accurate, speed matters more.
+    /// Used to determine when to flush. Doesn't need to be exact.
     fn size_estimate(&self) -> usize;
 
-    /// Provides currently stored data.
+    /// Returns a snapshot of all entries in sorted order.
     fn snapshot(&self) -> Vec<(Bytes, Record)>;
 
-    /// Builds SSTable from memtable via SSTableBuilder.
-    /// [crate::lsm_storage::LSMStorage] gurantees to use this method on immutable memtables only.
-    /// Default uses snapshot, override for effective way to sink everything from memtable to [SSTableBuilder]
+    /// Writes all entries to an SSTable builder.
+    ///
+    /// Override this for more efficient implementations than using [`snapshot()`](Memtable::snapshot).
     fn write_to_sst(&self, builder: &mut SSTableBuilder) {
         for (k, v) in self.snapshot() {
             builder.add(k, v);
@@ -40,7 +52,10 @@ pub trait Memtable {
     }
 }
 
-/// Memtable implementation based on [BTreeMap]
+/// Memtable implementation using [`std::collections::BTreeMap`].
+///
+/// Uses [`RwLock`] for synchronization - allows multiple concurrent readers
+/// or a single writer.
 #[derive(Debug)]
 pub struct BtreeMapMemtable {
     id: usize,
@@ -95,7 +110,10 @@ impl Memtable for BtreeMapMemtable {
     }
 }
 
-/// Memtable implementation based on [SkipMap]
+/// Memtable implementation using [`crossbeam_skiplist::SkipMap`].
+///
+/// Lock-free implementation with better concurrent write performance
+/// than [`BtreeMapMemtable`].
 pub struct SkipListMemtable {
     id: usize,
     size: AtomicUsize,

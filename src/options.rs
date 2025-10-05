@@ -9,42 +9,95 @@ const DEFAULT_NUM_FLUSH_WORKERS: usize = 2;
 const DEFAULT_MAX_L0_SSTS: usize = 4;
 const DEFAULT_DURABLE_WAL: bool = false;
 
-/// Configuration for LSMStorage
+/// Configuration options for LSM-tree storage engine.
+///
+/// # Example
+/// ```no_run
+/// use lsm_tree::options::LSMStorageOptions;
+///
+/// let options = LSMStorageOptions::default()
+///     .block_size(4096)
+///     .memtable_size(8 * 1024 * 1024)
+///     .max_l0_ssts(4)
+///     .num_flush_jobs(2)
+///     .durable_wal(false);
+/// ```
 #[derive(Clone)]
 pub struct LSMStorageOptions {
+    /// Size of each block in bytes within SSTables.
     pub block_size: usize,
+    /// Maximum size of memtable in bytes before triggering flush.
     pub memtables_size: usize,
+    /// Number of concurrent flush worker tasks.
     pub num_flush_jobs: usize,
+    /// Number of L0 SSTables to trigger compaction.
     pub max_l0_ssts: usize,
+    /// Whether to fsync WAL after each write for durability.
     pub durable_wal: bool,
 }
 
 impl LSMStorageOptions {
-    /// Size of a block in SSTable.
+    /// Sets the block size for SSTables in bytes.
+    ///
+    /// Smaller blocks reduce read amplification but increase metadata overhead.
+    /// Larger blocks are more efficient but may read unnecessary data.
+    ///
+    /// Default: 4096 bytes (4 KB)
     pub fn block_size(mut self, size: usize) -> Self {
         self.block_size = size;
         self
     }
-    /// Size of memtables
+
+    /// Sets the maximum memtable size in bytes.
+    ///
+    /// When a memtable exceeds this size, it's flushed to disk as an SSTable.
+    /// Larger memtables reduce write amplification but use more memory.
+    ///
+    /// Default: 8 MB
     pub fn memtable_size(mut self, size: usize) -> Self {
         self.memtables_size = size;
         self
     }
-    /// Number of L0 sstables to trigger compaction
+
+    /// Sets the number of L0 SSTables that trigger compaction.
+    ///
+    /// When L0 has this many SSTables, they're compacted into L1.
+    /// Lower values reduce read amplification but increase write amplification.
+    ///
+    /// Default: 4 SSTables
     pub fn max_l0_ssts(mut self, max_number: usize) -> Self {
         self.max_l0_ssts = max_number;
         self
     }
-    /// Number of async flush tasks
+
+    /// Sets the number of concurrent flush worker tasks.
+    ///
+    /// More workers allow parallel flushing but use more resources.
+    ///
+    /// Default: 2 workers
     pub fn num_flush_jobs(mut self, jobs: usize) -> Self {
         self.num_flush_jobs = jobs;
         self
     }
-    /// Sync after each append to the wal
+
+    /// Enables or disables durable WAL writes.
+    ///
+    /// When true, each WAL write is fsynced to disk for durability.
+    /// When false, writes are buffered for better performance but less durability.
+    ///
+    /// Default: false
     pub fn durable_wal(mut self, durable: bool) -> Self {
         self.durable_wal = durable;
         self
     }
+
+    /// Opens LSM-tree storage with these options.
+    ///
+    /// # Type Parameters
+    /// - `M`: The memtable implementation to use (e.g., BtreeMapMemtable, SkipListMemtable)
+    ///
+    /// # Errors
+    /// Returns an error if unable to create/open storage directory or recover state.
     pub async fn open<M: Memtable + Sync + Send + 'static>(
         self,
         path: impl AsRef<Path>,

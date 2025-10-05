@@ -144,7 +144,7 @@ mod tests {
             for j in 0..100 {
                 let key = format!("key-{i}-{j}").into_bytes();
                 let expected = Bytes::from_owner(format!("value-{i}-{j}"));
-                let actual = storage.get(&key).await?; 
+                let actual = storage.get(&key).await?;
                 assert_eq!(actual, Some(expected));
             }
         }
@@ -216,7 +216,7 @@ mod tests {
     #[rstest]
     #[case(BtreeMapMemtable::new(0))]
     #[case(SkipListMemtable::new(0))]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_repeat_same_key<M: ThreadSafeMemtable>(#[case] _memtable: M) -> Result<()> {
         let dir = tempdir()?;
         let storage = LSMStorageOptions::default()
@@ -245,7 +245,7 @@ mod tests {
     #[rstest]
     #[case(BtreeMapMemtable::new(0))]
     #[case(SkipListMemtable::new(0))]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_flush_race_conditions<M: ThreadSafeMemtable>(#[case] _memtable: M) -> Result<()> {
         let dir = tempdir()?;
         let options = LSMStorageOptions::default()
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[rstest]
-    // #[case(BtreeMapMemtable::new(0))]
+    #[case(BtreeMapMemtable::new(0))]
     #[case(SkipListMemtable::new(0))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
     async fn concurrent_read_write_stress_test<M: ThreadSafeMemtable>(
@@ -284,7 +284,7 @@ mod tests {
 
         const NUM_WRITER_TASKS: usize = 6;
         const NUM_READER_TASKS: usize = 4;
-        const OPS_PER_WRITER: usize = 1_000;
+        const OPS_PER_WRITER: usize = 100_000;
         const DELETE_RATIO: f64 = 0.3;
 
         let options = LSMStorageOptions::default()

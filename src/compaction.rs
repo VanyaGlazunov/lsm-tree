@@ -90,6 +90,7 @@ impl LeveledCompactionStrategy {
 }
 
 impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
+    /// Starts a background worker that periodically checks for and runs compactions.
     pub(crate) fn start_compaction_worker(
         path: PathBuf,
         options: LSMStorageOptions,
@@ -137,6 +138,9 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         })
     }
 
+    /// Executes a compaction task.
+    ///
+    /// Merges the source and target SSTables into a single new SSTable.
     pub(crate) async fn run_compaction(
         path: &Path,
         block_size: usize,
@@ -153,7 +157,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         ids.sort();
         for id in &ids {
             if let Some(sst) = sstables.get(id) {
-                iters.push(SSTableIterator::new(Arc::new(sst.try_clone()?)));
+                iters.push(SSTableIterator::new(sst.clone()));
             }
         }
 

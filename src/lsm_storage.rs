@@ -34,7 +34,7 @@ pub(crate) type ImmutableMemtableMap<M> = BTreeMap<usize, Arc<M>>;
 pub(crate) type SSTableMap = BTreeMap<usize, Arc<SSTable>>;
 pub(crate) type Levels = Vec<Vec<usize>>;
 
-/// Builds SSTable from memtable via SSTableBuilder.
+/// Builds an SSTable from a memtable.
 pub(crate) async fn memtable_to_sst(
     block_size: usize,
     path: impl AsRef<Path>,
@@ -50,6 +50,10 @@ pub(crate) async fn memtable_to_sst(
         .context(format!("Failed to flush memtable. id: {id}"))
 }
 
+/// Represents a key-value record in the LSM-tree.
+///
+/// Records can either contain a value ([`Record::Put`]) or represent
+/// a deletion tombstone ([`Record::Delete`]).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Record {
     Put(Bytes),
@@ -97,7 +101,48 @@ pub(crate) struct StateWriterContext<M> {
     pub snapshot_sender: watch::Sender<StateSnapshot<M>>,
 }
 
-/// Main storage engine.
+/// Log-Structured Merge-tree (LSM-tree) storage engine.
+///
+/// This is the main entry point for the LSM-tree key-value store. It provides
+/// asynchronous operations for inserting, retrieving, and deleting keys.
+///
+/// # Architecture
+///
+/// The LSM-tree consists of:
+/// - **Memtable**: In-memory buffer for recent writes
+/// - **Immutable Memtables**: Memtables being flushed to disk
+/// - **SSTables**: Sorted string tables on disk organized in levels
+/// - **WAL**: Write-ahead log for crash recovery
+/// - **Manifest**: Append-only log tracking SSTable organization
+/// - **Compaction**: Background process merging SSTables
+///
+/// # Example
+///
+/// ```no_run
+/// use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
+/// use bytes::Bytes;
+///
+/// #[tokio::main]
+/// async fn main() -> anyhow::Result<()> {
+///     let storage = LSMStorageOptions::default()
+///         .open::<BtreeMapMemtable>("./data")
+///         .await?;
+///
+///     // Insert a key-value pair
+///     storage.insert(b"key1", Bytes::from("value1")).await?;
+///
+///     // Retrieve a value
+///     let value = storage.get(&b"key1").await?;
+///     assert_eq!(value, Some(Bytes::from("value1")));
+///
+///     // Delete a key
+///     storage.delete(&b"key1").await?;
+///
+///     // Graceful shutdown
+///     storage.close().await?;
+///     Ok(())
+/// }
+/// ```
 pub struct LSMStorage<M> {
     path: PathBuf,
     next_sst_id: Arc<AtomicUsize>,
@@ -216,29 +261,28 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                 while let Some(result) = state_update_receiver.recv().await {
                     match result {
                         StateUpdateEvent::FlushComplete(id, sst) => {
-                            // continue;
-                            context
+                            if let Err(e) = context
                                 .manifest
                                 .lock()
                                 .await
                                 .add_record(ManifestRecord::Flush(id))
-                                .unwrap();
+                            {
+                                eprintln!("Failed to add flush record to manifest: {}", e);
+                                continue;
+                            }
 
                             let mut snapshot = context.snapshot_sender.borrow().clone();
-                            let mut sstables = (*snapshot.sstables).clone();
-                            let mut levels = (*snapshot.levels).clone();
-                            let mut imm_memtables = (*snapshot.imm_memtables).clone();
+
+                            let sstables = Arc::make_mut(&mut snapshot.sstables);
+                            let levels = Arc::make_mut(&mut snapshot.levels);
+                            let imm_memtables = Arc::make_mut(&mut snapshot.imm_memtables);
 
                             sstables.insert(id, sst.into());
                             levels[0].push(id);
                             levels[0].sort_unstable();
                             imm_memtables.remove(&id);
 
-                            snapshot.sstables = sstables.into();
-                            snapshot.levels = levels.into();
-                            snapshot.imm_memtables = imm_memtables.into();
-
-                            context.snapshot_sender.send(snapshot).unwrap();
+                            let _ = context.snapshot_sender.send(snapshot);
 
                             let wal_path = Wal::get_wal_path(&path, id);
                             if let Err(e) = remove_file(&wal_path) {
@@ -263,18 +307,19 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                                 remove_stts: old_ids.clone(),
                             };
 
-                            context
-                                .manifest
-                                .lock()
-                                .await
-                                .add_record(manifest_record)
-                                .unwrap();
+                            if let Err(e) =
+                                context.manifest.lock().await.add_record(manifest_record)
+                            {
+                                eprintln!("Failed to add compaction record to manifest: {}", e);
+                                continue;
+                            }
 
                             let mut snapshot = context.snapshot_sender.borrow().clone();
-                            let mut sstables = (*snapshot.sstables).clone();
-                            let mut levels = (*snapshot.levels).clone();
 
-                            for level in &mut levels {
+                            let sstables = Arc::make_mut(&mut snapshot.sstables);
+                            let levels = Arc::make_mut(&mut snapshot.levels);
+
+                            for level in levels.iter_mut() {
                                 level.retain(|id| !old_ids.contains(id));
                             }
 
@@ -294,40 +339,44 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                                 sstables.get(id).map_or(Bytes::new(), |sst| sst.first_key())
                             });
 
-                            snapshot.sstables = sstables.into();
-                            snapshot.levels = levels.into();
-
-                            context.snapshot_sender.send(snapshot).unwrap();
+                            let _ = context.snapshot_sender.send(snapshot);
                         }
                         StateUpdateEvent::CompactionFailed(e) => {
                             eprintln!("Error during compaction: {}", e)
                         }
                         StateUpdateEvent::NewMemtable(old_memtable, new_id, ack) => {
                             if let Some(new_id) = new_id {
-                                context
+                                if let Err(e) = context
                                     .manifest
                                     .lock()
                                     .await
                                     .add_record(ManifestRecord::NewMemtable(new_id))
-                                    .context("Failed to add NewMemtable record to manifest")
-                                    .unwrap();
+                                {
+                                    eprintln!(
+                                        "Failed to add NewMemtable record to manifest: {}",
+                                        e
+                                    );
+                                }
                             }
 
                             let mut snapshot = context.snapshot_sender.borrow().clone();
-                            let mut imm_memtables = (*snapshot.imm_memtables).clone();
-                            imm_memtables.insert(old_memtable.get_id(), old_memtable);
-                            snapshot.imm_memtables = imm_memtables.into();
-                            context.snapshot_sender.send(snapshot).unwrap();
 
-                            ack.send(()).unwrap();
+                            let imm_memtables = Arc::make_mut(&mut snapshot.imm_memtables);
+                            imm_memtables.insert(old_memtable.get_id(), old_memtable);
+
+                            let _ = context.snapshot_sender.send(snapshot);
+
+                            let _ = ack.send(());
                         }
                         StateUpdateEvent::Close(id) => {
-                            context
+                            if let Err(e) = context
                                 .manifest
                                 .lock()
                                 .await
                                 .add_record(ManifestRecord::Flush(id))
-                                .unwrap();
+                            {
+                                eprintln!("Failed to add close flush record to manifest: {}", e);
+                            }
                         }
                     }
                 }
@@ -437,7 +486,34 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         Ok((imm_memtables_map, memtables_to_flush))
     }
 
-    /// Graceful shutdown (waits until all data will be flushed).
+    /// Gracefully shuts down the storage engine.
+    ///
+    /// This method:
+    /// 1. Flushes the current memtable to disk if it contains data
+    /// 2. Waits for all pending flush operations to complete
+    /// 3. Stops the compaction worker
+    /// 4. Waits for all background tasks to finish
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing fails or background tasks panic.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
+    /// # #[tokio::main]
+    /// # async fn main() -> anyhow::Result<()> {
+    /// let storage = LSMStorageOptions::default()
+    ///     .open::<BtreeMapMemtable>("./data")
+    ///     .await?;
+    ///
+    /// // ... use storage ...
+    ///
+    /// storage.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn close(self) -> Result<()> {
         let memtable = self.memtable.into_inner();
         if memtable.size_estimate() > 0 {
@@ -456,15 +532,72 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         Ok(())
     }
 
-    /// Inserts key-value pair.
+    /// Inserts a key-value pair into the storage.
+    ///
+    /// The write is first recorded in the WAL for durability, then added to
+    /// the in-memory memtable. If the memtable exceeds the configured size,
+    /// it's asynchronously flushed to disk as an SSTable.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert (must be non-empty)
+    /// * `value` - The value to associate with the key
     ///
     /// # Errors
-    /// Returns error if key is empty.
+    ///
+    /// Returns an error if:
+    /// - The key is empty
+    /// - WAL append fails
+    /// - Flush initiation fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
+    /// # use bytes::Bytes;
+    /// # #[tokio::main]
+    /// # async fn main() -> anyhow::Result<()> {
+    /// # let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>("./data").await?;
+    /// storage.insert(b"user:123", Bytes::from("Alice")).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn insert(&self, key: impl AsRef<[u8]>, value: Bytes) -> Result<()> {
         self.insert_inner(key, Record::Put(value)).await
     }
 
-    /// Retrieves value for key.
+    /// Retrieves the value associated with a key.
+    ///
+    /// The search follows this order:
+    /// 1. Current memtable (most recent writes)
+    /// 2. Immutable memtables (being flushed)
+    /// 3. L0 SSTables (newest to oldest)
+    /// 4. L1+ SSTables (using key range filtering)
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(value))` - Key found with associated value
+    /// * `Ok(None)` - Key not found or was deleted
+    /// * `Err(_)` - I/O or decoding error
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
+    /// # use bytes::Bytes;
+    /// # #[tokio::main]
+    /// # async fn main() -> anyhow::Result<()> {
+    /// # let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>("./data").await?;
+    /// if let Some(value) = storage.get(&b"user:123").await? {
+    ///     println!("Found: {:?}", value);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get(&self, key: &impl AsRef<[u8]>) -> Result<Option<Bytes>> {
         let snapshot = self.state_snapshot_receiver.borrow().clone();
         let key = key.as_ref();
@@ -485,7 +618,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         if let Some(level0) = snapshot.levels.first() {
             for sst_id in level0.iter().rev() {
                 if let Some(sst) = snapshot.sstables.get(sst_id) {
-                    if let Some(rec) = sst.get(key)? {
+                    if let Some(rec) = sst.get(key).await? {
                         return Ok(rec.into_inner());
                     }
                 }
@@ -496,7 +629,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
             for sst_id in level {
                 if let Some(sst) = snapshot.sstables.get(sst_id) {
                     if key >= sst.first_key().as_ref() && key <= sst.last_key().as_ref() {
-                        if let Some(rec) = sst.get(key)? {
+                        if let Some(rec) = sst.get(key).await? {
                             return Ok(rec.into_inner());
                         }
                         break;
@@ -507,10 +640,34 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         Ok(None)
     }
 
-    /// Deletes key.
+    /// Deletes a key from the storage.
+    ///
+    /// This writes a deletion tombstone to the WAL and memtable.
+    /// The actual space won't be reclaimed until compaction removes
+    /// the tombstone and any older versions of the key.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to delete (must be non-empty)
     ///
     /// # Errors
-    /// Returns error if key is empty.
+    ///
+    /// Returns an error if:
+    /// - The key is empty
+    /// - WAL append fails
+    /// - Flush initiation fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
+    /// # #[tokio::main]
+    /// # async fn main() -> anyhow::Result<()> {
+    /// # let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>("./data").await?;
+    /// storage.delete(&b"user:123").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn delete(&self, key: &impl AsRef<[u8]>) -> Result<()> {
         self.insert_inner(key, TOMBSTONE).await
     }
@@ -543,15 +700,37 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         Ok(())
     }
 
-    /// Forces flush of current memtable.
+    /// Forces the current memtable to be flushed to disk.
+    ///
+    /// This method waits for any ongoing flush to complete, then flushes
+    /// the current memtable if it contains any data. Useful for:
+    /// - Ensuring data is persisted before shutdown
+    /// - Testing flush behavior
+    /// - Forcing compaction by creating more L0 SSTables
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flush operation fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
+    /// # #[tokio::main]
+    /// # async fn main() -> anyhow::Result<()> {
+    /// # let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>("./data").await?;
+    /// storage.force_flush().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn force_flush(&self) -> Result<()> {
-        let lock = self.flush_lock.try_lock();
+        // Wait for any ongoing flush to complete (blocking)
+        let _lock = self.flush_lock.lock().await;
+
+        // Check if current memtable has data
         let memtable = self.memtable.load();
-        if lock.is_ok() {
-            let current_memtable = self.memtable.load();
-            if Arc::ptr_eq(&memtable, &current_memtable) {
-                return self.flush().await;
-            }
+        if memtable.size_estimate() > 0 {
+            self.flush().await?;
         }
 
         Ok(())
@@ -665,7 +844,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_compaction_is_triggered_automatically() -> Result<()> {
         let dir = tempdir().unwrap();
         let storage = LSMStorageOptions::default()

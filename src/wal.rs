@@ -94,12 +94,22 @@ impl WalEntry {
     }
 }
 
+/// Write-Ahead Log for durability.
+///
+/// Each memtable has its own WAL file. Writes are appended sequentially
+/// for high write throughput. When a memtable is flushed, its WAL is deleted.
 pub struct Wal {
     file: File,
     durable: bool,
 }
 
 impl Wal {
+    /// Opens or creates a WAL file.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the WAL file
+    /// * `durable` - If true, fsync after each write for durability
     pub fn open(path: impl AsRef<Path>, durable: bool) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
@@ -112,6 +122,9 @@ impl Wal {
         Ok(Self { file, durable })
     }
 
+    /// Appends a key-value record to the WAL.
+    ///
+    /// If `durable` is true, the write is fsynced to ensure persistence.
     pub fn append(&mut self, key: Bytes, value: &Record) -> Result<()> {
         let entry = WalEntry {
             key,
@@ -132,6 +145,9 @@ impl Wal {
         Ok(())
     }
 
+    /// Returns an iterator over all records in the WAL.
+    ///
+    /// Used during recovery to replay writes.
     pub fn iter(self) -> WalIterator {
         WalIterator {
             wal: self,
@@ -139,11 +155,15 @@ impl Wal {
         }
     }
 
+    /// Constructs the path for a WAL file given a memtable ID.
     pub(crate) fn get_wal_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
         path.as_ref().to_path_buf().join(format!("{id}.wal"))
     }
 }
 
+/// Iterator over WAL entries.
+///
+/// Stops on first decode error to avoid corrupting state with partial writes.
 pub struct WalIterator {
     wal: Wal,
     stop: bool,

@@ -9,7 +9,6 @@ use std::{
 
 /// Append-only log for normal/crash recovery.
 pub(crate) struct Manifest {
-    /// File handle of the log.
     file: File,
 }
 

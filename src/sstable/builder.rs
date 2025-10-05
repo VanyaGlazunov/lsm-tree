@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::{fs::File, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use bloomfilter::Bloom;
 use bytes::{BufMut, Bytes};
+use memmap2::Mmap;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{block::builder::BlockBuilder, lsm_storage::Record};
@@ -129,8 +130,14 @@ impl SSTableBuilder {
             .await
             .context("Failed to sync sstable file")?;
 
+        drop(file);
+
+        let file = File::open(path.as_ref()).context("Failed to reopen SSTable for mmap")?;
+        let mmap = unsafe { Mmap::map(&file)? };
+
         Ok(SSTable {
             path: path.as_ref().to_path_buf(),
+            mmap: Arc::new(mmap),
             first_key: self.meta.first().unwrap().first_key.clone(),
             last_key: self.meta.last().unwrap().last_key.clone(),
             meta: self.meta,

@@ -113,7 +113,7 @@ mod tests {
         Ok((sst, dir))
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_merge_iterator_simple() -> Result<()> {
         let (sst1, _dir1) = create_sstable(&[("a", "1"), ("c", "3")]).await?;
         let (sst2, _dir2) = create_sstable(&[("b", "2"), ("d", "4")]).await?;
@@ -131,7 +131,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_merge_iterator_duplicates() -> Result<()> {
         let (sst1, _dir1) = create_sstable(&[("a", "old_a"), ("c", "new_c")]).await?;
         let (sst2, _dir2) = create_sstable(&[("a", "new_a"), ("b", "b_val")]).await?;
@@ -151,7 +151,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_merge_iterator_tombstone() -> Result<()> {
         let dir1 = tempdir()?;
         let sst1 = {
