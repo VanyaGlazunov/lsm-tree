@@ -1,3 +1,5 @@
+//! Configuration options for LSM-tree storage engine.
+
 use std::path::Path;
 
 use crate::{lsm_storage::LSMStorage, memtable::Memtable};
@@ -8,6 +10,8 @@ const DEFAULT_MEMTABLE_SIZE: usize = 1 << 23;
 const DEFAULT_NUM_FLUSH_WORKERS: usize = 2;
 const DEFAULT_MAX_L0_SSTS: usize = 4;
 const DEFAULT_DURABLE_WAL: bool = false;
+const DEFAULT_BASE_LEVEL_SIZE_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_LEVEL_SIZE_MULTIPLIER: usize = 10;
 
 /// Configuration options for LSM-tree storage engine.
 ///
@@ -34,6 +38,10 @@ pub struct LSMStorageOptions {
     pub max_l0_ssts: usize,
     /// Whether to fsync WAL after each write for durability.
     pub durable_wal: bool,
+    /// Target size in bytes for L1 (base level).
+    pub base_level_size_bytes: usize,
+    /// Size multiplier between levels (e.g., 10 means L2 is 10x L1).
+    pub level_size_multiplier: usize,
 }
 
 impl LSMStorageOptions {
@@ -91,6 +99,28 @@ impl LSMStorageOptions {
         self
     }
 
+    /// Sets the target size for L1 (base level) in bytes.
+    ///
+    /// This determines when L1 should compact into L2.
+    /// Larger values reduce write amplification but increase read amplification.
+    ///
+    /// Default: 10 MB
+    pub fn base_level_size_bytes(mut self, size: usize) -> Self {
+        self.base_level_size_bytes = size;
+        self
+    }
+
+    /// Sets the size multiplier between levels.
+    ///
+    /// For example, with multiplier 10: L2 = 10 × L1, L3 = 10 × L2, etc.
+    /// Higher values reduce write amplification but increase space amplification.
+    ///
+    /// Default: 10
+    pub fn level_size_multiplier(mut self, multiplier: usize) -> Self {
+        self.level_size_multiplier = multiplier;
+        self
+    }
+
     /// Opens LSM-tree storage with these options.
     ///
     /// # Type Parameters
@@ -114,6 +144,8 @@ impl Default for LSMStorageOptions {
             num_flush_jobs: DEFAULT_NUM_FLUSH_WORKERS,
             max_l0_ssts: DEFAULT_MAX_L0_SSTS,
             durable_wal: DEFAULT_DURABLE_WAL,
+            base_level_size_bytes: DEFAULT_BASE_LEVEL_SIZE_BYTES,
+            level_size_multiplier: DEFAULT_LEVEL_SIZE_MULTIPLIER,
         }
     }
 }

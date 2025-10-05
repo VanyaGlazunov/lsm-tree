@@ -91,6 +91,11 @@ impl SSTable {
         self.last_key.clone()
     }
 
+    /// Returns approximate size of SSTable file in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.mmap.len()
+    }
+
     pub(crate) fn get_sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
         path.as_ref().to_path_buf().join(format!("{id}.sst"))
     }

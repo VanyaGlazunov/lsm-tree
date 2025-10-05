@@ -1,3 +1,5 @@
+//! Log-Structured Merge-tree (LSM-tree) storage engine.
+
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{create_dir_all, remove_file},
@@ -16,6 +18,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
 };
+use tracing::error;
 
 use crate::{
     compaction::CompactionResult,
@@ -267,7 +270,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                                 .await
                                 .add_record(ManifestRecord::Flush(id))
                             {
-                                eprintln!("Failed to add flush record to manifest: {}", e);
+                                error!(error = %e, memtable_id = id, "Failed to add flush record to manifest");
                                 continue;
                             }
 
@@ -286,11 +289,11 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
 
                             let wal_path = Wal::get_wal_path(&path, id);
                             if let Err(e) = remove_file(&wal_path) {
-                                eprintln!("Failed to remove WAL file {wal_path:?}: {e}");
+                                error!(error = %e, wal_path = ?wal_path, "Failed to remove WAL file");
                             }
                         }
                         StateUpdateEvent::FlushFail(e) => {
-                            eprintln!("Error during flush: {}", e)
+                            error!(error = %e, "Flush operation failed");
                         }
                         StateUpdateEvent::CompactionComplete(CompactionResult {
                             task,
@@ -310,7 +313,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                             if let Err(e) =
                                 context.manifest.lock().await.add_record(manifest_record)
                             {
-                                eprintln!("Failed to add compaction record to manifest: {}", e);
+                                error!(error = %e, new_sst_id = new_id, target_level = target, "Failed to add compaction record to manifest");
                                 continue;
                             }
 
@@ -323,8 +326,8 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                                 level.retain(|id| !old_ids.contains(id));
                             }
 
-                            for id in old_ids {
-                                sstables.remove(&id);
+                            for id in &old_ids {
+                                sstables.remove(id);
                             }
 
                             while levels.len() <= target {
@@ -340,9 +343,18 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                             });
 
                             let _ = context.snapshot_sender.send(snapshot);
+
+                            // Delete old SSTable files after state update
+                            // SAFETY (Unix-specific):
+                            for id in &old_ids {
+                                let sst_path = SSTable::get_sst_path(&path, *id);
+                                if let Err(e) = remove_file(&sst_path) {
+                                    error!(error = %e, sst_id = id, "Failed to delete old SSTable file");
+                                }
+                            }
                         }
                         StateUpdateEvent::CompactionFailed(e) => {
-                            eprintln!("Error during compaction: {}", e)
+                            error!(error = %e, "Compaction operation failed");
                         }
                         StateUpdateEvent::NewMemtable(old_memtable, new_id, ack) => {
                             if let Some(new_id) = new_id {
@@ -352,10 +364,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                                     .await
                                     .add_record(ManifestRecord::NewMemtable(new_id))
                                 {
-                                    eprintln!(
-                                        "Failed to add NewMemtable record to manifest: {}",
-                                        e
-                                    );
+                                    error!(error = %e, memtable_id = new_id, "Failed to add NewMemtable record to manifest");
                                 }
                             }
 
@@ -375,7 +384,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                                 .await
                                 .add_record(ManifestRecord::Flush(id))
                             {
-                                eprintln!("Failed to add close flush record to manifest: {}", e);
+                                error!(error = %e, memtable_id = id, "Failed to add close flush record to manifest");
                             }
                         }
                     }

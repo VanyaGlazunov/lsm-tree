@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use tokio::sync::{mpsc, Semaphore};
+use tracing::warn;
 
 use crate::lsm_storage::{memtable_to_sst, LSMStorage, StateUpdateEvent};
 use crate::memtable::Memtable;
@@ -31,14 +32,22 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
                         let id = memtable.get_id();
 
                         match memtable_to_sst(block_size, &*path, &*memtable).await {
-                            Ok(sst) => state_update_sender
-                                .send(StateUpdateEvent::FlushComplete(id, sst))
-                                .await
-                                .unwrap(),
-                            Err(e) => state_update_sender
-                                .send(StateUpdateEvent::FlushFail(e))
-                                .await
-                                .unwrap(),
+                            Ok(sst) => {
+                                if let Err(e) = state_update_sender
+                                    .send(StateUpdateEvent::FlushComplete(id, sst))
+                                    .await
+                                {
+                                    warn!(error = %e, memtable_id = id, "Failed to send flush complete (likely shutdown)");
+                                }
+                            }
+                            Err(e) => {
+                                if let Err(send_err) = state_update_sender
+                                    .send(StateUpdateEvent::FlushFail(e))
+                                    .await
+                                {
+                                    warn!(error = %send_err, "Failed to send flush failure (likely shutdown)");
+                                }
+                            }
                         }
 
                         drop(permit);
