@@ -39,8 +39,8 @@ pub trait Memtable {
     /// Used to determine when to flush. Doesn't need to be exact.
     fn size_estimate(&self) -> usize;
 
-    /// Returns a snapshot of all entries in sorted order.
-    fn snapshot(&self) -> Vec<(Bytes, Record)>;
+    /// Returns an iterator over a snapshot of all entries in sorted order.
+    fn snapshot(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + Send>;
 
     /// Writes all entries to an SSTable builder.
     ///
@@ -93,13 +93,15 @@ impl Memtable for BtreeMapMemtable {
         self.size.load(Ordering::Relaxed)
     }
 
-    fn snapshot(&self) -> Vec<(Bytes, Record)> {
-        self.container
+    fn snapshot(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + Send> {
+        let snapshot: Vec<_> = self
+            .container
             .read()
             .unwrap()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect();
+        Box::new(snapshot.into_iter())
     }
 
     fn write_to_sst(&self, builder: &mut SSTableBuilder) {
@@ -147,11 +149,14 @@ impl Memtable for SkipListMemtable {
         self.size.load(Ordering::Relaxed)
     }
 
-    fn snapshot(&self) -> Vec<(Bytes, Record)> {
-        self.container
+    fn snapshot(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + Send> {
+        // Collect snapshot to avoid holding references across threads
+        let snapshot: Vec<_> = self
+            .container
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
-            .collect()
+            .collect();
+        Box::new(snapshot.into_iter())
     }
 
     fn write_to_sst(&self, builder: &mut SSTableBuilder) {
@@ -160,3 +165,7 @@ impl Memtable for SkipListMemtable {
         }
     }
 }
+
+pub trait ThreadSafeMemtable: Memtable + Send + Sync + 'static {}
+impl ThreadSafeMemtable for BtreeMapMemtable {}
+impl ThreadSafeMemtable for SkipListMemtable {}

@@ -227,14 +227,8 @@ impl SSTable {
 
         let mmap = Arc::clone(&self.mmap);
 
-        // Decode in spawn_blocking to avoid blocking tokio runtime
-        // The actual memory access is instant, but deserialization can take time
-        tokio::task::spawn_blocking(move || {
-            let block_data = &mmap[block_offset..end_offset];
-            Block::decode(block_data).context("Failed to decode block")
-        })
-        .await
-        .context("Blocking task panicked")?
+        let block_data = &mmap[block_offset..end_offset];
+        Block::decode(block_data).context("Failed to decode block")
     }
 }
 

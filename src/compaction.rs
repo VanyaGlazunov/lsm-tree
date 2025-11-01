@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bytes::Bytes;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -14,8 +15,8 @@ use tokio::{
 use tracing::{error, warn};
 
 use crate::{
-    lsm_storage::{LSMStorage, Levels, SSTableMap, StateSnapshot, StateUpdateEvent},
-    memtable::Memtable,
+    lsm_storage::{LSMStorage, Levels, Record, SSTableMap, StateSnapshot, StateUpdateEvent},
+    memtable::ThreadSafeMemtable,
     options::LSMStorageOptions,
     sstable::{builder::SSTableBuilder, merge_iterator::MergeIterator, SSTable, SSTableIterator},
 };
@@ -169,7 +170,7 @@ impl LeveledCompactionStrategy {
     }
 }
 
-impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
+impl<M: ThreadSafeMemtable> LSMStorage<M> {
     /// Starts a background worker that periodically checks for and runs compactions.
     pub(crate) fn start_compaction_worker(
         path: PathBuf,
@@ -237,20 +238,20 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
         sstables: &SSTableMap,
         levels: &Levels,
     ) -> Result<CompactionResult> {
-        let mut iters = Vec::new();
+        let mut iters: Vec<Box<dyn Iterator<Item = (Bytes, Record)> + Send>> = Vec::new();
         let mut ids = [
             task.source_level_ssts.clone(),
             task.target_level_ssts.clone(),
         ]
         .concat();
-        ids.sort();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
         for id in &ids {
             if let Some(sst) = sstables.get(id) {
-                iters.push(SSTableIterator::new(sst.clone()));
+                iters.push(Box::new(SSTableIterator::new(sst.clone())));
             }
         }
 
-        let merge_iter = MergeIterator::new(iters)?;
+        let merge_iter = MergeIterator::new(iters);
 
         let target_level = task.source_level + 1;
         let is_last_level = target_level >= levels.len() - 1;

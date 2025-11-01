@@ -7,3 +7,6 @@ pub mod memtable;
 pub mod options;
 mod sstable;
 mod wal;
+
+#[cfg(feature = "chunkfs-integration")]
+pub mod chunkfs_adapter;

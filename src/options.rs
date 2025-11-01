@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{lsm_storage::LSMStorage, memtable::Memtable};
+use crate::{lsm_storage::LSMStorage, memtable::ThreadSafeMemtable};
 use anyhow::Result;
 
 const DEFAULT_BLOCK_SIZE: usize = 1 << 12;
@@ -128,7 +128,7 @@ impl LSMStorageOptions {
     ///
     /// # Errors
     /// Returns an error if unable to create/open storage directory or recover state.
-    pub async fn open<M: Memtable + Sync + Send + 'static>(
+    pub async fn open<M: ThreadSafeMemtable>(
         self,
         path: impl AsRef<Path>,
     ) -> Result<LSMStorage<M>> {

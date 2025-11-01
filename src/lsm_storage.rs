@@ -23,9 +23,9 @@ use tracing::error;
 use crate::{
     compaction::CompactionResult,
     manifest::{Manifest, ManifestRecord},
-    memtable::Memtable,
+    memtable::{Memtable, ThreadSafeMemtable},
     options::LSMStorageOptions,
-    sstable::{builder::SSTableBuilder, SSTable},
+    sstable::{builder::SSTableBuilder, merge_iterator::MergeIterator, SSTable, SSTableIterator},
     wal::Wal,
 };
 
@@ -170,7 +170,7 @@ pub(crate) enum StateUpdateEvent<M> {
     Close(usize),
 }
 
-impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
+impl<M: ThreadSafeMemtable> LSMStorage<M> {
     /// Opens/Creates storage in path given.
     pub async fn open(path: impl AsRef<Path>, options: LSMStorageOptions) -> Result<Self> {
         let path = path.as_ref();
@@ -497,32 +497,9 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
 
     /// Gracefully shuts down the storage engine.
     ///
-    /// This method:
-    /// 1. Flushes the current memtable to disk if it contains data
-    /// 2. Waits for all pending flush operations to complete
-    /// 3. Stops the compaction worker
-    /// 4. Waits for all background tasks to finish
-    ///
     /// # Errors
     ///
     /// Returns an error if flushing fails or background tasks panic.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
-    /// # #[tokio::main]
-    /// # async fn main() -> anyhow::Result<()> {
-    /// let storage = LSMStorageOptions::default()
-    ///     .open::<BtreeMapMemtable>("./data")
-    ///     .await?;
-    ///
-    /// // ... use storage ...
-    ///
-    /// storage.close().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn close(self) -> Result<()> {
         let memtable = self.memtable.into_inner();
         if memtable.size_estimate() > 0 {
@@ -542,10 +519,6 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
     }
 
     /// Inserts a key-value pair into the storage.
-    ///
-    /// The write is first recorded in the WAL for durability, then added to
-    /// the in-memory memtable. If the memtable exceeds the configured size,
-    /// it's asynchronously flushed to disk as an SSTable.
     ///
     /// # Arguments
     ///
@@ -576,12 +549,6 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
     }
 
     /// Retrieves the value associated with a key.
-    ///
-    /// The search follows this order:
-    /// 1. Current memtable (most recent writes)
-    /// 2. Immutable memtables (being flushed)
-    /// 3. L0 SSTables (newest to oldest)
-    /// 4. L1+ SSTables (using key range filtering)
     ///
     /// # Arguments
     ///
@@ -636,13 +603,15 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
 
         for level in snapshot.levels.iter().skip(1) {
             for sst_id in level {
-                if let Some(sst) = snapshot.sstables.get(sst_id) {
-                    if key >= sst.first_key().as_ref() && key <= sst.last_key().as_ref() {
-                        if let Some(rec) = sst.get(key).await? {
-                            return Ok(rec.into_inner());
-                        }
-                        break;
+                let sst = snapshot
+                    .sstables
+                    .get(sst_id)
+                    .expect("Levels and SSTables should be consistent");
+                if key >= sst.first_key().as_ref() && key <= sst.last_key().as_ref() {
+                    if let Some(rec) = sst.get(key).await? {
+                        return Ok(rec.into_inner());
                     }
+                    break;
                 }
             }
         }
@@ -650,10 +619,7 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
     }
 
     /// Deletes a key from the storage.
-    ///
-    /// This writes a deletion tombstone to the WAL and memtable.
-    /// The actual space won't be reclaimed until compaction removes
-    /// the tombstone and any older versions of the key.
+    /// The actual space won't be reclaimed until compaction happens
     ///
     /// # Arguments
     ///
@@ -665,17 +631,6 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
     /// - The key is empty
     /// - WAL append fails
     /// - Flush initiation fails
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
-    /// # #[tokio::main]
-    /// # async fn main() -> anyhow::Result<()> {
-    /// # let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>("./data").await?;
-    /// storage.delete(&b"user:123").await?;
-    /// # Ok(())
-    /// # }
     /// ```
     pub async fn delete(&self, key: &impl AsRef<[u8]>) -> Result<()> {
         self.insert_inner(key, TOMBSTONE).await
@@ -711,32 +666,13 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
 
     /// Forces the current memtable to be flushed to disk.
     ///
-    /// This method waits for any ongoing flush to complete, then flushes
-    /// the current memtable if it contains any data. Useful for:
-    /// - Ensuring data is persisted before shutdown
-    /// - Testing flush behavior
-    /// - Forcing compaction by creating more L0 SSTables
-    ///
     /// # Errors
     ///
     /// Returns an error if the flush operation fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use lsm_tree::{lsm_storage::LSMStorage, memtable::BtreeMapMemtable, options::LSMStorageOptions};
-    /// # #[tokio::main]
-    /// # async fn main() -> anyhow::Result<()> {
-    /// # let storage = LSMStorageOptions::default().open::<BtreeMapMemtable>("./data").await?;
-    /// storage.force_flush().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn force_flush(&self) -> Result<()> {
         // Wait for any ongoing flush to complete (blocking)
         let _lock = self.flush_lock.lock().await;
 
-        // Check if current memtable has data
         let memtable = self.memtable.load();
         if memtable.size_estimate() > 0 {
             self.flush().await?;
@@ -777,6 +713,201 @@ impl<M: Memtable + Send + Sync + 'static> LSMStorage<M> {
             .send(old_memtable)
             .await
             .context("Failed to send memtable into flush channel")?;
+
+        Ok(())
+    }
+
+    /// Captures a consistent snapshot at the moment of creation. The iterator
+    /// will not see any writes that occur after it is created.
+    ///
+    /// # Returns
+    ///
+    /// A new [`crate::iterator::SnapshotIterator`] positioned at the first key in the storage.
+    pub async fn iter(&self) -> impl Iterator<Item = (Bytes, Record)> {
+        let mut iters: Vec<Box<dyn Iterator<Item = (Bytes, Record)> + Send>> = Vec::new();
+
+        iters.push(self.memtable.load().snapshot());
+
+        let snapshot = self.state_snapshot_receiver.borrow().clone();
+        for m in snapshot.imm_memtables.values() {
+            iters.push(m.snapshot());
+        }
+
+        if let Some(level0) = snapshot.levels.first() {
+            for sst_id in level0 {
+                let sst = snapshot
+                    .sstables
+                    .get(sst_id)
+                    .expect("Levels and SSTables should be consistent");
+                iters.push(Box::new(SSTableIterator::new(sst.clone())));
+            }
+        }
+
+        for level in snapshot.levels.iter().skip(1) {
+            for sst_id in level {
+                let sst = snapshot
+                    .sstables
+                    .get(sst_id)
+                    .expect("Levels and SSTables should be consistent");
+                iters.push(Box::new(SSTableIterator::new(sst.clone())));
+            }
+        }
+
+        MergeIterator::new(iters).filter(|(_k, v)| v.value_len() > 0)
+    }
+
+    /// Batch insert multiple key-value pairs.
+    ///
+    /// # Arguments
+    ///
+    /// * `pairs` - Iterator of (key, value) pairs to insert
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - All keys successfully inserted
+    /// * `Err(_)` - Error occurred during insertion
+    pub async fn insert_batch(
+        &self,
+        pairs: impl IntoIterator<Item = (impl AsRef<[u8]>, Bytes)>,
+    ) -> Result<()> {
+        self.insert_batch_inner(pairs, false).await
+    }
+
+    /// Batch retrieve values for multiple keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `keys` - Slice of keys to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<Option<Bytes>>)` - Vector of results in same order as input keys
+    /// * `Err(_)` - I/O or decoding error
+    pub async fn get_batch(&self, keys: &[impl AsRef<[u8]>]) -> Result<Vec<Option<Bytes>>> {
+        let snapshot = self.state_snapshot_receiver.borrow().clone();
+        let memtable = self.memtable.load();
+        let mut results = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            let key = key.as_ref();
+
+            if let Some(rec) = memtable.get(key) {
+                results.push(rec.into_inner());
+                continue;
+            }
+
+            let mut found = false;
+            for imm_memtable in snapshot.imm_memtables.values().rev() {
+                if let Some(rec) = imm_memtable.get(key) {
+                    results.push(rec.into_inner());
+                    found = true;
+                    break;
+                }
+            }
+
+            if found {
+                continue;
+            }
+
+            let mut value = None;
+            if let Some(level0) = snapshot.levels.first() {
+                for sst_id in level0.iter().rev() {
+                    if let Some(sst) = snapshot.sstables.get(sst_id) {
+                        if let Some(rec) = sst.get(key).await? {
+                            value = rec.into_inner();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if value.is_none() {
+                for level in snapshot.levels.iter().skip(1) {
+                    for sst_id in level {
+                        let sst = snapshot
+                            .sstables
+                            .get(sst_id)
+                            .expect("Levels and SSTables should be consistent");
+                        if key >= sst.first_key().as_ref() && key <= sst.last_key().as_ref() {
+                            if let Some(rec) = sst.get(key).await? {
+                                value = rec.into_inner();
+                                break;
+                            }
+                        }
+                    }
+                    if value.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            results.push(value);
+        }
+
+        Ok(results)
+    }
+
+    /// Batch delete multiple keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `keys` - Slice of keys to delete
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - All keys successfully marked for deletion
+    /// * `Err(_)` - Error occurred during deletion
+    pub async fn delete_batch(&self, keys: &[impl AsRef<[u8]>]) -> Result<()> {
+        let pairs = keys.iter().map(|k| (k.as_ref(), Bytes::new()));
+        self.insert_batch_inner(pairs, true).await
+    }
+
+    async fn insert_batch_inner(
+        &self,
+        pairs: impl IntoIterator<Item = (impl AsRef<[u8]>, Bytes)>,
+        is_delete: bool,
+    ) -> Result<()> {
+        let pairs: Vec<(Bytes, Record)> = pairs
+            .into_iter()
+            .map(|(k, v)| {
+                let key = Bytes::copy_from_slice(k.as_ref());
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("Empty keys are not allowed"));
+                }
+                let record = if is_delete {
+                    Record::Delete
+                } else {
+                    Record::Put(v)
+                };
+                Ok((key, record))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut wal = self.wal.lock().await;
+            for (key, value) in &pairs {
+                wal.append(key.clone(), value)?;
+            }
+        }
+
+        let memtable = self.memtable.load();
+        for (key, value) in pairs {
+            memtable.set(key, value);
+        }
+
+        if memtable.size_estimate() > self.options.memtables_size {
+            let lock = self.flush_lock.try_lock();
+            if lock.is_ok() {
+                let current_memtable = self.memtable.load();
+                if Arc::ptr_eq(&memtable, &current_memtable) {
+                    self.flush().await.context("Failed to start flushing")?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -880,6 +1011,122 @@ mod tests {
         assert_eq!(storage.get(&b"b").await.unwrap(), Some(Bytes::from("1")));
         assert_eq!(storage.get(&b"c").await.unwrap(), Some(Bytes::from("2")));
         assert_eq!(storage.get(&b"d").await.unwrap(), Some(Bytes::from("2")));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_basic_iteration() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
+
+        storage.insert(b"a", Bytes::from("value_a")).await?;
+        storage.insert(b"b", Bytes::from("value_b")).await?;
+        storage.insert(b"c", Bytes::from("value_c")).await?;
+
+        let iter = storage.iter().await;
+        let entries: Vec<_> = iter.collect();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, Bytes::from("a"));
+        assert_eq!(entries[1].0, Bytes::from("b"));
+        assert_eq!(entries[2].0, Bytes::from("c"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iteration_with_deletes() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
+
+        storage.insert(b"a", Bytes::from("1")).await?;
+        storage.insert(b"b", Bytes::from("2")).await?;
+        storage.delete(b"a").await?;
+        storage.insert(b"c", Bytes::from("3")).await?;
+
+        let iter = storage.iter().await;
+        let entries: Vec<_> = iter.collect();
+
+        dbg!(&entries);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, Bytes::from("b"));
+        assert_eq!(entries[1].0, Bytes::from("c"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_consistency() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
+
+        storage.insert(b"a", Bytes::from("1")).await?;
+        storage.insert(b"b", Bytes::from("2")).await?;
+
+        let iter = storage.iter().await;
+
+        storage.insert(b"c", Bytes::from("3")).await?;
+        storage.insert(b"d", Bytes::from("4")).await?;
+
+        let entries: Vec<_> = iter.collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, Bytes::from("a"));
+        assert_eq!(entries[1].0, Bytes::from("b"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iteration_across_levels() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
+
+        storage.insert(b"a", Bytes::from("old_a")).await?;
+        storage.insert(b"b", Bytes::from("old_b")).await?;
+        storage.force_flush().await?;
+
+        storage.insert(b"a", Bytes::from("new_a")).await?;
+        storage.insert(b"c", Bytes::from("new_c")).await?;
+
+        let snap = storage.state_snapshot_receiver.borrow().clone();
+        dbg!(&storage.memtable);
+        dbg!(&snap.imm_memtables);
+        dbg!(&snap.sstables);
+
+        let iter = storage.iter().await;
+        let entries: Vec<_> = iter.collect();
+        dbg!(&entries);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, Bytes::from("a"));
+        assert_eq!(entries[0].1, Record::Put(Bytes::from("new_a")));
+        assert_eq!(entries[1].0, Bytes::from("b"));
+        assert_eq!(entries[2].0, Bytes::from("c"));
+        assert_eq!(entries[2].1, Record::Put(Bytes::from("new_c")));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_empty_storage_iteration() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = LSMStorageOptions::default()
+            .open::<BtreeMapMemtable>(&dir)
+            .await?;
+
+        let iter = storage.iter().await;
+        let entries: Vec<_> = iter.collect();
+
+        assert_eq!(entries.len(), 0);
 
         Ok(())
     }

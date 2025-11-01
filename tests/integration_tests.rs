@@ -5,6 +5,7 @@ mod tests {
     use lsm_tree::memtable::BtreeMapMemtable;
     use lsm_tree::memtable::Memtable;
     use lsm_tree::memtable::SkipListMemtable;
+    use lsm_tree::memtable::ThreadSafeMemtable;
     use lsm_tree::options::LSMStorageOptions;
     use rstest::rstest;
     use std::result::Result::Ok;
@@ -12,10 +13,6 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::sync::{watch, Barrier};
-
-    trait ThreadSafeMemtable: Memtable + Send + Sync + 'static {}
-    impl ThreadSafeMemtable for BtreeMapMemtable {}
-    impl ThreadSafeMemtable for SkipListMemtable {}
 
     #[rstest]
     #[case(BtreeMapMemtable::new(0))]

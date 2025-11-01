@@ -1,5 +1,4 @@
-use crate::{lsm_storage::Record, sstable::SSTableIterator};
-use anyhow::Result;
+use crate::lsm_storage::Record;
 use bytes::Bytes;
 use std::{cmp::Ordering, collections::BinaryHeap};
 
@@ -25,19 +24,19 @@ impl PartialOrd for HeapItem {
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.item.0.cmp(&other.item.0).reverse() {
-            Ordering::Equal => self.iterator_idx.cmp(&other.iterator_idx),
+            Ordering::Equal => self.iterator_idx.cmp(&other.iterator_idx).reverse(),
             other => other,
         }
     }
 }
 
 pub struct MergeIterator {
-    iters: Vec<SSTableIterator>,
+    iters: Vec<Box<dyn Iterator<Item = (Bytes, Record)> + Send>>,
     heap: BinaryHeap<HeapItem>,
 }
 
 impl MergeIterator {
-    pub fn new(mut iters: Vec<SSTableIterator>) -> Result<Self> {
+    pub fn new(mut iters: Vec<Box<dyn Iterator<Item = (Bytes, Record)> + Send>>) -> Self {
         let mut heap = BinaryHeap::new();
 
         for (idx, iter) in iters.iter_mut().enumerate() {
@@ -49,7 +48,7 @@ impl MergeIterator {
             }
         }
 
-        Ok(Self { iters, heap })
+        Self { iters, heap }
     }
 }
 
@@ -90,12 +89,14 @@ mod tests {
     use super::*;
     use crate::{
         lsm_storage::Record,
-        sstable::{builder::SSTableBuilder, SSTable},
+        sstable::{builder::SSTableBuilder, SSTable, SSTableIterator},
     };
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    async fn create_sstable(data: &[(&str, Option<&str>)]) -> Result<(SSTable, tempfile::TempDir)> {
+    async fn create_sstable(
+        data: &[(&str, Option<&str>)],
+    ) -> Result<(SSTable, tempfile::TempDir), anyhow::Error> {
         let dir = tempdir()?;
         let path = dir.path().join("test.sst");
         let mut builder = SSTableBuilder::new(1024);
@@ -113,13 +114,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_merge_iterator_simple() -> Result<()> {
+    async fn test_merge_iterator_simple() -> Result<(), anyhow::Error> {
         let (sst1, _dir1) = create_sstable(&[("a", Some("1")), ("c", Some("3"))]).await?;
         let (sst2, _dir2) = create_sstable(&[("b", Some("2")), ("d", Some("4"))]).await?;
 
         let iter1 = SSTableIterator::new(Arc::new(sst1));
         let iter2 = SSTableIterator::new(Arc::new(sst2));
-        let mut merge_iter = MergeIterator::new(vec![iter1, iter2])?;
+        let mut merge_iter = MergeIterator::new(vec![Box::new(iter1), Box::new(iter2)]);
 
         assert_eq!(merge_iter.next().unwrap().0, "a");
         assert_eq!(merge_iter.next().unwrap().0, "b");
@@ -131,13 +132,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_merge_iterator_duplicates() -> Result<()> {
+    async fn test_merge_iterator_duplicates() -> Result<(), anyhow::Error> {
         let (sst1, _dir1) = create_sstable(&[("a", Some("old_a")), ("c", Some("new_c"))]).await?;
         let (sst2, _dir2) = create_sstable(&[("a", Some("new_a")), ("b", Some("b_val"))]).await?;
 
-        let iter1 = SSTableIterator::new(Arc::new(sst1));
-        let iter2 = SSTableIterator::new(Arc::new(sst2));
-        let mut merge_iter = MergeIterator::new(vec![iter1, iter2])?;
+        let iter_old = SSTableIterator::new(Arc::new(sst1));
+        let iter_new = SSTableIterator::new(Arc::new(sst2));
+        let mut merge_iter = MergeIterator::new(vec![Box::new(iter_new), Box::new(iter_old)]);
 
         let (k, v) = merge_iter.next().unwrap();
         assert_eq!(k, "a");
@@ -151,13 +152,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_merge_iterator_tombstone() -> Result<()> {
+    async fn test_merge_iterator_tombstone() -> Result<(), anyhow::Error> {
         let (sst1, _dir1) = create_sstable(&[("a", Some("new_a")), ("b", None)]).await?;
         let (sst2, _dir2) = create_sstable(&[("b", Some("old_b")), ("c", Some("c_val"))]).await?;
 
-        let iter1 = SSTableIterator::new(Arc::new(sst1));
-        let iter2 = SSTableIterator::new(Arc::new(sst2));
-        let mut merge_iter = MergeIterator::new(vec![iter2, iter1])?;
+        let iter_new = SSTableIterator::new(Arc::new(sst1));
+        let iter_old = SSTableIterator::new(Arc::new(sst2));
+        let mut merge_iter = MergeIterator::new(vec![Box::new(iter_new), Box::new(iter_old)]);
 
         let (k1, v1) = merge_iter.next().unwrap();
         assert_eq!(k1, "a");
