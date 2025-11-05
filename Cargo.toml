@@ -8,7 +8,12 @@ tempfile = "3.2"
 chunkfs = { git = "https://github.com/Piletskii-Oleg/chunkfs.git", branch = "main", features = ["chunkers", "hashers"] }
 criterion = "0.5"
 approx = "0.5"
+rand = "0.8"
 
 [[bench]]
 name = "write_read"
+harness = false
+
+[[bench]]
+name = "lsm_throughput"
 harness = false

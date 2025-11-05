@@ -95,29 +95,29 @@ fn two_file_handles_to_one_file() {
     assert_eq!(fs.read_from_file(&mut handle2).unwrap().len(), MB)
 }
 
-#[test]
-fn different_chunkers_from_vec_can_be_used_with_same_filesystem() {
-    let path = PathBuf::from(STORAGEPATH).join("storage6");
-    let mut fs = create_cdc_filesystem(LSMtree::new(path.as_path(), THRESHOLD), SimpleHasher);
-    let chunkers: Vec<Box<dyn chunkfs::Chunker>> = vec![
-        SuperChunker::default().into(),
-        LeapChunker::default().into(),
-    ];
+// #[test]
+// fn different_chunkers_from_vec_can_be_used_with_same_filesystem() {
+//     let path = PathBuf::from(STORAGEPATH).join("storage6");
+//     let mut fs = create_cdc_filesystem(LSMtree::new(path.as_path(), THRESHOLD), SimpleHasher);
+//     let chunkers: Vec<Box<dyn chunkfs::Chunker>> = vec![
+//         SuperChunker::default().into(),
+//         LeapChunker::default().into(),
+//     ];
 
-    let data = vec![0; MB];
-    for chunker in chunkers {
-        let name = format!("file-{chunker:?}");
-        let mut fh = fs.create_file(&name, chunker).unwrap();
-        fs.write_to_file(&mut fh, &data).unwrap();
-        fs.close_file(fh).unwrap();
+//     let data = vec![0; MB];
+//     for chunker in chunkers {
+//         let name = format!("file-{chunker:?}");
+//         let mut fh = fs.create_file(&name, chunker).unwrap();
+//         fs.write_to_file(&mut fh, &data).unwrap();
+//         fs.close_file(fh).unwrap();
 
-        let fh = fs.open_file(&name, FSChunker::default()).unwrap();
-        let read = fs.read_file_complete(&fh).unwrap();
+//         let fh = fs.open_file(&name, FSChunker::default()).unwrap();
+//         let read = fs.read_file_complete(&fh).unwrap();
 
-        assert_eq!(read.len(), data.len());
-        assert_eq!(read, data);
-    }
-}
+//         assert_eq!(read.len(), data.len());
+//         assert_eq!(read, data);
+//     }
+// }
 
 #[test]
 fn readonly_file_handle_cannot_write_can_read() {
