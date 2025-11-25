@@ -1,14 +1,16 @@
-use std::{fs::OpenOptions, io::Write, path::Path};
+use std::{fs::File, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use bloomfilter::Bloom;
 use bytes::{BufMut, Bytes};
+use memmap2::Mmap;
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{block::builder::BlockBuilder, lsm_storage::Record};
 
 use super::{BlockMeta, SSTable};
 
-const RP_RATE: f64 = 0.001;
+const FP_RATE: f64 = 0.001;
 
 /// Constructs SSTable from key-value stream.
 pub struct SSTableBuilder {
@@ -35,7 +37,7 @@ impl SSTableBuilder {
         }
     }
 
-    /// Adda entry to future SSTable.
+    /// Adds entry to future SSTable.
     pub fn add(&mut self, key: Bytes, value: Record) {
         if self.current_first_key.is_empty() {
             self.current_first_key = key.clone();
@@ -54,7 +56,7 @@ impl SSTableBuilder {
         self.current_last_key = key;
     }
 
-    // builds current block and adds it to future SSTable.
+    // Builds current block and adds it to future SSTable.
     fn finish_block(&mut self) {
         if self.block_builder.is_empty() {
             return;
@@ -90,8 +92,8 @@ impl SSTableBuilder {
         buf
     }
 
-    /// Finilizes SSTable and writes on disk all serialized data (also fsyncs).
-    pub fn build(mut self, path: impl AsRef<Path>) -> Result<SSTable> {
+    /// Finilizes SSTable and writes on disk all serialized data.
+    pub async fn build(mut self, path: impl AsRef<Path>) -> Result<SSTable> {
         if self.current_first_key.is_empty() {
             anyhow::bail!("Empty SSTables are not allowed");
         }
@@ -103,7 +105,8 @@ impl SSTableBuilder {
             .read(true)
             .create(true)
             .truncate(true)
-            .open(path)
+            .open(&path)
+            .await
             .context("Failed to create file for SSTable")?;
 
         let meta_offset = self.data.len();
@@ -114,8 +117,7 @@ impl SSTableBuilder {
 
         let bloom_offset = buf.len();
 
-        // TODO:
-        let mut bloom = Bloom::new_for_fp_rate(self.keys.len(), RP_RATE).unwrap();
+        let mut bloom = Bloom::new_for_fp_rate(self.keys.len(), FP_RATE).unwrap();
         self.keys.into_iter().for_each(|key| bloom.set(&*key));
 
         buf.extend(bloom.as_slice());
@@ -123,11 +125,19 @@ impl SSTableBuilder {
         buf.put_u32((bloom_offset - meta_offset) as u32);
         buf.put_u32(meta_offset as u32);
 
-        file.write_all(&buf).context("Failed to write sstablw")?;
-        file.sync_all().context("Failed to sync sstable file")?;
+        file.write_all(&buf).await?;
+        file.sync_all()
+            .await
+            .context("Failed to sync sstable file")?;
+
+        drop(file);
+
+        let file = File::open(path.as_ref()).context("Failed to reopen SSTable for mmap")?;
+        let mmap = unsafe { Mmap::map(&file)? };
 
         Ok(SSTable {
-            file,
+            path: path.as_ref().to_path_buf(),
+            mmap: Arc::new(mmap),
             first_key: self.meta.first().unwrap().first_key.clone(),
             last_key: self.meta.last().unwrap().last_key.clone(),
             meta: self.meta,

@@ -1,7 +1,12 @@
-pub mod block;
-pub mod flush_system;
+mod block;
+mod compaction;
+mod flush_system;
 pub mod lsm_storage;
-pub mod lsm_utils;
-pub mod manifest;
+mod manifest;
 pub mod memtable;
-pub mod sstable;
+pub mod options;
+mod sstable;
+mod wal;
+
+#[cfg(feature = "chunkfs-integration")]
+pub mod chunkfs_adapter;

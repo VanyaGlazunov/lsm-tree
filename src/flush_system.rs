@@ -1,106 +1,62 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
-use tokio::{
-    sync::{mpsc::Receiver, Mutex, RwLock, Semaphore},
-    task::JoinHandle,
-};
+use tokio::sync::{mpsc, Semaphore};
+use tracing::warn;
 
-use crate::lsm_storage::FLUSH_CHANNEL_SIZE;
-use crate::{
-    lsm_storage::LSMStorageOptions,
-    lsm_utils::flush_memtable,
-    manifest::{Manifest, ManifestRecord},
-    memtable::Memtable,
-    sstable::SSTable,
-};
+use crate::lsm_storage::{memtable_to_sst, LSMStorage, StateUpdateEvent};
+use crate::memtable::ThreadSafeMemtable;
 
-pub(crate) struct FlushSystem<M: Memtable + Send + Sync> {
-    pub imm_memtables: Arc<RwLock<BTreeMap<usize, M>>>,
-    pub l0_tables: Arc<RwLock<Vec<usize>>>,
-    pub sstables: Arc<RwLock<BTreeMap<usize, SSTable>>>,
-    pub manifest: Arc<Mutex<Manifest>>,
-    pub path: PathBuf,
-    pub options: LSMStorageOptions,
-}
-
-/// Handle to operate on flush channel.
-#[derive(Debug)]
-pub struct FlushHandle<M: Memtable + Send + Sync + 'static> {
-    pub handle: JoinHandle<()>,
-    pub sender: tokio::sync::mpsc::Sender<FlushCommand<M>>,
-}
-
-/// Types of comands in flush channel.
-pub enum FlushCommand<M: Memtable + Send + Sync + 'static> {
-    Memtable(M),
-    Shutdown,
-}
-
-impl<M: Memtable + Send + Sync> FlushSystem<M> {
-    /// Spawns task with reciever for immutable memtables.
-    /// For each recieved memtable spawns task
-    /// (number of tasks always <= flush_num_jobs)
-    /// that flushes it, writes metainfo into manifest,
-    /// removes immutable memtable from LSMStorage, adds sstable to LSMStorage.
-    pub fn init(self) -> FlushHandle<M> {
-        let (tx, rx) = tokio::sync::mpsc::channel(FLUSH_CHANNEL_SIZE);
-        let path = Arc::new(self.path);
-
-        let handle = tokio::spawn({
+impl<M: ThreadSafeMemtable> LSMStorage<M> {
+    pub(crate) fn start_flush_workers(
+        path: PathBuf,
+        num_jobs: usize,
+        block_size: usize,
+        flush_receiver: mpsc::Receiver<Arc<M>>,
+        state_update_sender: mpsc::Sender<StateUpdateEvent<M>>,
+    ) {
+        tokio::spawn({
             async move {
-                let semaphore = Arc::new(Semaphore::new(self.options.num_flush_jobs));
-                let mut receiver: Receiver<FlushCommand<M>> = rx;
+                let semaphore = Arc::new(Semaphore::new(num_jobs));
+                let mut receiver = flush_receiver;
+                let path = Arc::new(path);
 
-                while let Some(cmd) = receiver.recv().await {
-                    match cmd {
-                        FlushCommand::Memtable(memtable) => {
-                            let permit = match semaphore.clone().acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => break, // Semaphore closed
-                            };
+                while let Some(memtable) = receiver.recv().await {
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break, // Semaphore closed
+                    };
+                    let state_update_sender = state_update_sender.clone();
+                    let path = path.clone();
 
-                            let imm_memtables = self.imm_memtables.clone();
-                            let l0_sstables = self.l0_tables.clone();
-                            let sstables = self.sstables.clone();
-                            let manifest = self.manifest.clone();
-                            let path = Arc::clone(&path);
+                    tokio::spawn(async move {
+                        let id = memtable.get_id();
 
-                            tokio::spawn(async move {
-                                let id = memtable.get_id();
-
-                                // TODO: Error handling
-                                let sst = flush_memtable(
-                                    self.options.block_size,
-                                    path.as_path(),
-                                    &memtable,
-                                )
-                                .await
-                                .unwrap();
-
-                                manifest
-                                    .lock()
+                        match memtable_to_sst(block_size, &*path, &*memtable).await {
+                            Ok(sst) => {
+                                if let Err(e) = state_update_sender
+                                    .send(StateUpdateEvent::FlushComplete(id, sst))
                                     .await
-                                    .add_record(ManifestRecord::Flush(id))
-                                    .unwrap();
-
-                                sstables.write().await.insert(id, sst);
-                                l0_sstables.write().await.push(id);
-                                imm_memtables.write().await.remove(&id);
-
-                                drop(permit);
-                            });
+                                {
+                                    warn!(error = %e, memtable_id = id, "Failed to send flush complete (likely shutdown)");
+                                }
+                            }
+                            Err(e) => {
+                                if let Err(send_err) = state_update_sender
+                                    .send(StateUpdateEvent::FlushFail(e))
+                                    .await
+                                {
+                                    warn!(error = %send_err, "Failed to send flush failure (likely shutdown)");
+                                }
+                            }
                         }
-                        FlushCommand::Shutdown => break,
-                    }
+
+                        drop(permit);
+                    });
                 }
 
                 // Wait for remaining permits
-                let _ = semaphore
-                    .acquire_many(self.options.num_flush_jobs as u32)
-                    .await;
+                let _ = semaphore.acquire_many(num_jobs as u32).await;
             }
         });
-
-        FlushHandle { handle, sender: tx }
     }
 }

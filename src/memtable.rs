@@ -1,45 +1,74 @@
-use std::collections::BTreeMap;
+//! In-memory buffer implementations for LSM-tree writes.
+//!
+//! Memtables temporarily hold recent writes before being flushed to SSTables.
+//! Two implementations are provided:
+//! - [`BtreeMapMemtable`] - Based on std BTreeMap (uses RwLock)
+//! - [`SkipListMemtable`] - Based on crossbeam SkipMap (lock-free)
+
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use bytes::Bytes;
+use crossbeam_skiplist::SkipMap;
+use std::sync::RwLock;
 
-use crate::lsm_storage::Record;
+use crate::{lsm_storage::Record, sstable::builder::SSTableBuilder};
 
-/// Trait represents in-memmory buffer of Log-Structured Merge Tree.
+/// In-memory buffer for recent writes in an LSM-tree.
+///
+/// Memtables provide fast reads and writes by keeping data in memory.
+/// When a memtable reaches its size limit, it becomes immutable and is flushed
+/// to disk as an SSTable.
 pub trait Memtable {
-    /// Creates new instance with given ID.
-    ///
-    /// [crate::lsm_storage::LSMStorage] associates monotonically increasing ID for each memtable and keeps a number of created memtables.
+    /// Creates a new memtable with the given ID.
     fn new(id: usize) -> Self;
-    /// Returns for given key if it exists, None otherwise.
+
+    /// Retrieves the record for a key, if it exists.
     fn get(&self, key: &[u8]) -> Option<Record>;
-    /// Inserts/Updates key-value pair.
-    fn set(&mut self, key: Bytes, value: Record);
-    /// Returns memtable ID.
+
+    /// Inserts or updates a key-value pair.
+    fn set(&self, key: Bytes, value: Record);
+
+    /// Returns the unique ID of this memtable.
     fn get_id(&self) -> usize;
-    /// Estimates the total size of stored data.
+
+    /// Returns an estimate of the total data size in bytes.
     ///
-    /// It is advised to implement it by adding size of keys and values inside [Memtable::set] method.
-    /// Estimations doesn't need to be very accurate, speed matters more.
+    /// Used to determine when to flush. Doesn't need to be exact.
     fn size_estimate(&self) -> usize;
 
-    /// Creates iterator overy sorted entries.
-    fn iter(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + '_>;
+    /// Returns an iterator over a snapshot of all entries in sorted order.
+    fn snapshot(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + Send>;
+
+    /// Writes all entries to an SSTable builder.
+    ///
+    /// Override this for more efficient implementations than using [`snapshot()`](Memtable::snapshot).
+    fn write_to_sst(&self, builder: &mut SSTableBuilder) {
+        for (k, v) in self.snapshot() {
+            builder.add(k, v);
+        }
+    }
 }
 
-/// Memtable implementation based on [BTreeMap]
-#[derive(Clone, Debug)]
+/// Memtable implementation using [`std::collections::BTreeMap`].
+///
+/// Uses [`RwLock`] for synchronization - allows multiple concurrent readers
+/// or a single writer.
+#[derive(Debug)]
 pub struct BtreeMapMemtable {
     id: usize,
-    size: usize,
-    container: BTreeMap<Bytes, Record>,
+    size: AtomicUsize,
+    container: RwLock<BTreeMap<Bytes, Record>>,
 }
 
 impl Memtable for BtreeMapMemtable {
     fn new(id: usize) -> Self {
         Self {
             id,
-            size: 0,
-            container: BTreeMap::new(),
+            size: 0.into(),
+            container: BTreeMap::new().into(),
         }
     }
 
@@ -48,19 +77,95 @@ impl Memtable for BtreeMapMemtable {
     }
 
     fn get(&self, key: &[u8]) -> Option<Record> {
-        self.container.get(key).cloned()
+        self.container
+            .read()
+            .map_or(None, |btree| btree.get(key).cloned())
     }
 
-    fn set(&mut self, key: Bytes, value: Record) {
-        self.size += key.len() + value.value_len();
-        self.container.insert(key, value);
+    fn set(&self, key: Bytes, value: Record) {
+        self.size
+            .fetch_add(key.len() + value.value_len(), Ordering::Relaxed);
+        let mut btree = self.container.write().unwrap();
+        btree.insert(key, value);
     }
 
     fn size_estimate(&self) -> usize {
-        self.size
+        self.size.load(Ordering::Relaxed)
     }
 
-    fn iter(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + '_> {
-        Box::new(self.container.iter().map(|(k, v)| (k.clone(), v.clone())))
+    fn snapshot(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + Send> {
+        let snapshot: Vec<_> = self
+            .container
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Box::new(snapshot.into_iter())
+    }
+
+    fn write_to_sst(&self, builder: &mut SSTableBuilder) {
+        let btree = self.container.read().unwrap();
+        for (key, value) in &*btree {
+            builder.add(key.clone(), value.clone());
+        }
     }
 }
+
+/// Memtable implementation using [`crossbeam_skiplist::SkipMap`].
+///
+/// Lock-free implementation with better concurrent write performance
+/// than [`BtreeMapMemtable`].
+pub struct SkipListMemtable {
+    id: usize,
+    size: AtomicUsize,
+    container: SkipMap<Bytes, Record>,
+}
+
+impl Memtable for SkipListMemtable {
+    fn new(id: usize) -> Self {
+        Self {
+            id,
+            size: AtomicUsize::new(0),
+            container: SkipMap::new(),
+        }
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Record> {
+        self.container.get(key).map(|e| e.value().clone())
+    }
+
+    fn set(&self, key: Bytes, value: Record) {
+        self.size
+            .fetch_add(key.len() + value.value_len(), Ordering::Relaxed);
+        self.container.insert(key, value);
+    }
+
+    fn get_id(&self) -> usize {
+        self.id
+    }
+
+    fn size_estimate(&self) -> usize {
+        self.size.load(Ordering::Relaxed)
+    }
+
+    fn snapshot(&self) -> Box<dyn Iterator<Item = (Bytes, Record)> + Send> {
+        // Collect snapshot to avoid holding references across threads
+        let snapshot: Vec<_> = self
+            .container
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        Box::new(snapshot.into_iter())
+    }
+
+    fn write_to_sst(&self, builder: &mut SSTableBuilder) {
+        for entry in &self.container {
+            builder.add(entry.key().clone(), entry.value().clone());
+        }
+    }
+}
+
+pub trait ThreadSafeMemtable: Memtable + Send + Sync + 'static {}
+impl ThreadSafeMemtable for BtreeMapMemtable {}
+impl ThreadSafeMemtable for SkipListMemtable {}

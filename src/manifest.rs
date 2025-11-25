@@ -5,13 +5,11 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::Path,
-    sync::{Arc, Mutex},
 };
 
 /// Append-only log for normal/crash recovery.
 pub(crate) struct Manifest {
-    /// File handle of the log.
-    file: Arc<Mutex<File>>,
+    file: File,
 }
 
 /// Operations types logged in manifest.
@@ -19,20 +17,24 @@ pub(crate) struct Manifest {
 pub(crate) enum ManifestRecord {
     NewMemtable(usize), // Creation of memtable with given ID
     Flush(usize),       // Flush of a memtable with given ID
+    Compaction {
+        // Compaction result: new files `add_ssts` are added to `level`, old files `remove_ssts` are removed.
+        level: usize,
+        add_stts: Vec<usize>,
+        remove_stts: Vec<usize>,
+    },
 }
 
 impl Manifest {
     /// Creates new instance of manifest in the path given.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            file: Arc::new(Mutex::new(
-                OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(path)
-                    .context("Failed to create manifest file")?,
-            )),
+            file: OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)
+                .context("Failed to create manifest file")?,
         })
     }
 
@@ -64,26 +66,24 @@ impl Manifest {
             records.push(record);
         }
 
-        let manifest = Self {
-            file: Arc::new(Mutex::new(file)),
-        };
+        let manifest = Self { file };
 
         Ok((manifest, records))
     }
 
     /// Adds record and fsyncs
-    pub fn add_record(&self, record: ManifestRecord) -> Result<()> {
-        let mut file = self.file.lock().unwrap();
-
+    pub fn add_record(&mut self, record: ManifestRecord) -> Result<()> {
         let buf = encode_to_vec(record, standard())?;
 
-        file.write_all(&buf.len().to_be_bytes())
+        self.file
+            .write_all(&buf.len().to_be_bytes())
             .context("Failed to wrtie record len to file")?;
 
-        file.write_all(&buf)
+        self.file
+            .write_all(&buf)
             .context("Failed to write record to file")?;
 
-        file.sync_all().context("Failed to sync file")?;
+        self.file.sync_all().context("Failed to sync file")?;
 
         Ok(())
     }
@@ -106,7 +106,7 @@ mod manifest_tests {
     #[test]
     fn test_record_roundtrip() -> Result<()> {
         let file = NamedTempFile::new()?;
-        let manifest = Manifest::new(file.path())?;
+        let mut manifest = Manifest::new(file.path())?;
 
         manifest.add_record(ManifestRecord::NewMemtable(1))?;
         manifest.add_record(ManifestRecord::Flush(1))?;
