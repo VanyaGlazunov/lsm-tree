@@ -227,7 +227,27 @@ impl SSTable {
 
         let mmap = Arc::clone(&self.mmap);
 
-        let block_data = &mmap[block_offset..end_offset];
+        let mmap_len = mmap.len();
+        if end_offset > mmap_len {
+            anyhow::bail!(
+                "Block end offset {} exceeds file size {}. Block index: {}, start offset: {}",
+                end_offset,
+                mmap_len,
+                block_index,
+                block_offset
+            );
+        }
+
+        if block_offset >= mmap_len {
+            anyhow::bail!(
+                "Block start offset {} exceeds file size {}. Block index: {}",
+                block_offset,
+                mmap_len,
+                block_index
+            );
+        }
+
+        let block_data = &mmap[block_offset..end_offset.min(mmap_len)];
         Block::decode(block_data).context("Failed to decode block")
     }
 }

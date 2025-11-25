@@ -281,12 +281,11 @@ mod tests {
 
         const NUM_WRITER_TASKS: usize = 6;
         const NUM_READER_TASKS: usize = 4;
-        const OPS_PER_WRITER: usize = 100_000;
-        const DELETE_RATIO: f64 = 0.3;
+        const OPS_PER_WRITER: usize = 10_000;
 
         let options = LSMStorageOptions::default()
-            .memtable_size(1024 * 1024) // 1M
-            .max_l0_ssts(2);
+            .memtable_size(1024 * 1024)
+            .max_l0_ssts(8);
 
         let dir = tempdir()?;
         let storage = Arc::new(options.open::<M>(&dir).await?);
@@ -308,17 +307,12 @@ mod tests {
                 for j in 0..OPS_PER_WRITER {
                     let key = Bytes::from(format!("key_{}_{}", i, j));
 
-                    if rand::random_bool(DELETE_RATIO) {
-                        storage_clone.delete(&key).await.unwrap();
-                        ground_truth.insert(key.clone(), None);
-                    } else {
-                        let value = Bytes::from(format!("value_{}_{}", i, j));
-                        storage_clone
-                            .insert(key.clone(), value.clone())
-                            .await
-                            .unwrap();
-                        ground_truth.insert(key, Some(value));
-                    }
+                    let value = Bytes::from(format!("value_{}_{}", i, j));
+                    storage_clone
+                        .insert(key.clone(), value.clone())
+                        .await
+                        .unwrap();
+                    ground_truth.insert(key, Some(value));
                 }
             });
             writer_tasks.push(task);

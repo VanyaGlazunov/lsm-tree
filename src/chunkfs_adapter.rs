@@ -41,13 +41,24 @@ use chunkfs::{Data, DataContainer, Database};
 /// adapter.insert(vec![1,2,3], vec![4,5,6]).unwrap();
 /// let value = adapter.get(&vec![1,2,3]).unwrap();
 /// ```
-#[derive(Clone)]
 pub struct LSMDatabaseAdapter<M>
 where
     M: Memtable + Send + Sync + 'static,
 {
     storage: Arc<LSMStorage<M>>,
     runtime: Arc<Runtime>,
+}
+
+impl<M> Clone for LSMDatabaseAdapter<M>
+where
+    M: Memtable + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
 }
 
 impl<M> LSMDatabaseAdapter<M>
@@ -78,6 +89,13 @@ where
         }
     }
 
+    pub fn with_runtime(storage: LSMStorage<M>, runtime: Runtime) -> Self {
+        Self {
+            storage: Arc::new(storage),
+            runtime: Arc::new(runtime),
+        }
+    }
+
     /// Consumes the adapter and returns the underlying storage.
     pub fn into_inner(self) -> Arc<LSMStorage<M>> {
         self.storage
@@ -86,6 +104,19 @@ where
     /// Returns a reference to the underlying storage.
     pub fn storage(&self) -> &Arc<LSMStorage<M>> {
         &self.storage
+    }
+
+    /// Shuts down the storage engine gracefully.
+    pub fn close(self) -> io::Result<()>
+    where
+        M: ThreadSafeMemtable,
+    {
+        let storage = Arc::try_unwrap(self.storage)
+            .map_err(|_| io::Error::new(ErrorKind::Other, "Storage is still in use"))?;
+
+        self.runtime
+            .block_on(storage.close())
+            .map_err(|e| io::Error::new(ErrorKind::Other, e))
     }
 }
 
